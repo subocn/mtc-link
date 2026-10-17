@@ -38,6 +38,7 @@
 #define CHG_CRYPT_BODY_MAX 24u
 #define CHG_CRYPT_FAIL_MAX 3u
 #define CHG_CRYPT_LOCK_MS 10000u
+#define CHG_CRYPT_PEER_MS 1000u /* 充电机令牌在 BMS 侧的保持时间 */
 
 #define CHG_MSG_HELLO_BMS 0x05u
 #define CHG_MSG_HELLO_CHR 0x06u
@@ -85,6 +86,7 @@ typedef struct {
     uint32_t rx_counter;
     uint32_t tx_counter;
     uint32_t lock_ms;
+    uint32_t peer_ms;    /* 方向 1 令牌的剩余毫秒。只在 BMS 侧递减 */
     uint8_t role;
     uint8_t port;
     uint8_t phase;
@@ -104,8 +106,10 @@ typedef struct {
     uint8_t pair_on;     /* 1：只接受 pair_id 这一只对端 */
     uint8_t seal;        /* 1：本机封条已断开，掉电也要由产品记住 */
     uint8_t peer_seal;   /* 对端 hello 带来的封条 */
+    uint8_t sk_ready;    /* 1：sk 已按本会话的盐和编号派生 */
     uint8_t asm_mask;
-    uint8_t key[CHG_CRYPT_KEY];
+    uint8_t key[CHG_CRYPT_KEY]; /* 长期密钥。只用于派生，不直接算标签 */
+    uint8_t sk[CHG_CRYPT_KEY];  /* 会话密钥。调用方不填写 */
     uint8_t salt_bms[CHG_CRYPT_SALT];
     uint8_t salt_chr[CHG_CRYPT_SALT];
     uint8_t id_self[CHG_CRYPT_ID];
@@ -122,7 +126,7 @@ void chg_sha256(ChgMacWork *w, const uint8_t *msg, size_t n, uint8_t out[32]);
 void chg_hmac_sha256(ChgMacWork *w, const uint8_t *key, size_t key_len,
                      const uint8_t *msg, size_t msg_len, uint8_t out[32]);
 
-/* key 为 16 字节长期密钥。suites 最多 4 个。flags 只用 bit0 与 bit1。 */
+/* key 为 16 字节长期密钥，只用来派生会话密钥。suites 最多 4 个。flags 只用 bit0 与 bit1。 */
 void chg_crypt_init(ChgCrypt *c, uint8_t role, uint8_t port,
                     const uint8_t key[CHG_CRYPT_KEY], const uint8_t id_self[CHG_CRYPT_ID],
                     const uint8_t *suites, uint8_t suite_n, uint8_t flags);

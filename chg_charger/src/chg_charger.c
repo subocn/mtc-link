@@ -294,6 +294,27 @@ void chg_apply(const ChgCtrl *ctrl, const ChgCap *cap, uint8_t cap_valid, uint8_
     act->enable = 1;
 }
 
+/* 无新鲜合法 0x04 时返回 1，家充仍按 0x01。允许电流不参与。 */
+static int bat_compatible(const ChrLink *l)
+{
+    const ChgBat *b = &l->bat;
+    uint8_t cc;
+    uint8_t bc;
+    if (l->bat_seen == 0u || b->valid == 0u || l->bat_age_ms > CHG_BAT_STALE_MS) {
+        return 1;
+    }
+    if (b->v_allow_01v > 0u && l->cap.v_max_01v > b->v_allow_01v) {
+        return 0;
+    }
+    cc = l->cap.chemistry;
+    bc = b->chemistry;
+    if ((cc == CHG_CHEM_NCM || cc == CHG_CHEM_LFP) &&
+        (bc == CHG_CHEM_NCM || bc == CHG_CHEM_LFP) && cc != bc) {
+        return 0;
+    }
+    return 1;
+}
+
 static int due(uint32_t *acc, uint32_t dt, uint32_t period, uint8_t *arm)
 {
     if (*arm == 0u) {
@@ -416,6 +437,12 @@ static void output_of(ChrLink *l, const ChgStat *meas, ChrTx *tx, int consume_re
     ChgCap cap = l->cap;
     cap.ready = l->advertise_ready;
     chg_apply(l->have_ctrl ? &l->ctrl : 0, &cap, cap_valid, link, conflict, fault, &tx->act);
+    /* 新鲜合法的 0x04 只做电压上限和化学体系。不改 chg_apply 的电流。 */
+    if (tx->act.enable && !bat_compatible(l)) {
+        tx->act.i_out_01a = 0;
+        tx->act.v_target_01v = 0;
+        tx->act.enable = 0;
+    }
     /* GB/T 18487.1-2023 10.7.2：直流接触器再次闭合时冲击电流峰值不超过 20 A。
      * 暂停恢复的第一拍把电流钳在 20.0 A，电压目标取接口电压减 1 V。 */
     if (l->resume_arm && tx->act.enable) {

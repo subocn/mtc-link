@@ -162,7 +162,23 @@ static void test_hmac_485(void)
     cover[17] = 1;
     cover[21] = CHG_DIR_BMS;
     memcpy(cover + 22, CTRL, 6);
-    chg_hmac_sha256(&wc, KEY, 16, cover, 57, full);
+    /* 会话密钥按固定 48 字节派生，不调用模块内部函数。未绑定，编号来自 hello。 */
+    {
+        uint8_t kdf[48];
+        uint8_t sk[16];
+        memset(kdf, 0, sizeof kdf);
+        kdf[3] = 0x01u;
+        memcpy(kdf + 4, "mtc-sk", 6);
+        memcpy(kdf + 11, SALT_BMS, 8);
+        memcpy(kdf + 19, SALT_CHR, 8);
+        memcpy(kdf + 27, ID_BMS, 8);
+        memcpy(kdf + 35, ID_CHR, 8);
+        kdf[43] = CHG_SUITE_HMAC;
+        kdf[47] = 0x80u;
+        chg_hmac_sha256(&wc, KEY, 16, kdf, 48, full);
+        memcpy(sk, full, 16);
+        chg_hmac_sha256(&wc, sk, 16, cover, 57, full);
+    }
     expect_mem("tag layout", f + 10, full, 8);
 
     expect_eq("rx token", (unsigned)chg_crypt_rx_frame(&chr, &wc, f, (size_t)n), 1);
@@ -539,6 +555,118 @@ static void test_pair(void)
     expect_eq("sif pair bms", (unsigned)chg_crypt_bms_may_allow(&bms), 0);
 }
 
+static uint16_t crc16_modbus(const uint8_t *data, size_t len)
+{
+    uint16_t crc = 0xFFFFu;
+    size_t i;
+    int b;
+    for (i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (b = 0; b < 8; b++) {
+            if (crc & 1u) {
+                crc = (uint16_t)((crc >> 1) ^ 0xA001u);
+            } else {
+                crc = (uint16_t)(crc >> 1);
+            }
+        }
+    }
+    return crc;
+}
+
+static void fix_crc(uint8_t *frame, int n)
+{
+    uint16_t crc;
+    if (n < 7) {
+        return;
+    }
+    crc = crc16_modbus(frame, (size_t)n - 2u);
+    frame[n - 2] = (uint8_t)(crc & 0xFFu);
+    frame[n - 1] = (uint8_t)(crc >> 8);
+}
+
+static void test_salt_and_fresh(void)
+{
+    ChgCrypt bms, chr;
+    ChgMacWork w;
+    uint8_t hmac[] = {CHG_SUITE_HMAC};
+    uint8_t plain[] = {CHG_SUITE_PLAIN};
+    uint8_t zero[8];
+    uint8_t f[48];
+    int n;
+
+    memset(zero, 0, sizeof zero);
+    arm(&bms, &chr, CHG_CRYPT_PORT_485, hmac, 1, 0);
+    chg_crypt_set_salt_bms(&bms, zero);
+    expect_eq("zero bms salt", (unsigned)chg_crypt_pack_hello_bms(&bms, f, sizeof f), (unsigned)-1);
+    expect_eq("zero bms unset", bms.salt_bms_set, 0);
+
+    arm(&bms, &chr, CHG_CRYPT_PORT_485, plain, 1, CHG_CRYPT_F_PLAIN);
+    chg_crypt_set_salt_bms(&bms, zero);
+    expect_eq("plain zero bms salt", (unsigned)chg_crypt_pack_hello_bms(&bms, f, sizeof f), (unsigned)-1);
+
+    arm(&bms, &chr, CHG_CRYPT_PORT_485, hmac, 1, 0);
+    n = chg_crypt_pack_hello_bms(&bms, f, sizeof f);
+    expect_eq("hello before zero salt", n, 29);
+    memset(f + 11, 0, 8);
+    fix_crc(f, n);
+    expect_eq("rx zero bms salt", (unsigned)chg_crypt_rx_frame(&chr, &w, f, (size_t)n), (unsigned)-1);
+    expect_eq("chr stays idle", chr.phase, CHG_CRYPT_PH_IDLE);
+
+    arm(&bms, &chr, CHG_CRYPT_PORT_485, hmac, 1, 0);
+    n = chg_crypt_pack_hello_bms(&bms, f, sizeof f);
+    expect_eq("chr sees hello", (unsigned)chg_crypt_rx_frame(&chr, &w, f, (size_t)n), 1);
+    chg_crypt_set_salt_chr(&chr, zero);
+    expect_eq("zero chr salt", (unsigned)chg_crypt_pack_hello_chr(&chr, f, sizeof f), (unsigned)-1);
+    expect_eq("chr waits", chr.phase, CHG_CRYPT_PH_WAIT);
+
+    arm(&bms, &chr, CHG_CRYPT_PORT_485, hmac, 1, 0);
+    n = chg_crypt_pack_hello_bms(&bms, f, sizeof f);
+    chg_crypt_rx_frame(&chr, &w, f, (size_t)n);
+    n = chg_crypt_pack_hello_chr(&chr, f, sizeof f);
+    expect_eq("chr hello n", n, 25);
+    memset(f + 7, 0, 8);
+    fix_crc(f, n);
+    expect_eq("rx zero chr salt", (unsigned)chg_crypt_rx_frame(&bms, &w, f, (size_t)n), (unsigned)-1);
+    expect_eq("bms stays wait", bms.phase, CHG_CRYPT_PH_WAIT);
+
+    arm(&bms, &chr, CHG_CRYPT_PORT_485, plain, 1, CHG_CRYPT_F_PLAIN);
+    chg_crypt_set_salt_chr(&chr, zero);
+    expect_eq("plain zero chr", (unsigned)hello_485(&bms, &chr, &w), 1);
+    expect_eq("plain still open", (unsigned)chg_crypt_output_allowed(&chr), 1);
+
+    arm(&bms, &chr, CHG_CRYPT_PORT_485, hmac, 1, CHG_CRYPT_F_BIDI);
+    hello_485(&bms, &chr, &w);
+    chg_crypt_set_ctrl(&bms, CTRL);
+    chg_crypt_set_ctrl(&chr, CTRL);
+    n = chg_crypt_pack_token(&bms, &w, f, sizeof f);
+    chg_crypt_rx_frame(&chr, &w, f, (size_t)n);
+    n = chg_crypt_pack_token(&chr, &w, f, sizeof f);
+    expect_eq("fresh chr token", (unsigned)chg_crypt_rx_frame(&bms, &w, f, (size_t)n), 1);
+    expect_eq("fresh open", (unsigned)chg_crypt_bms_may_allow(&bms), 1);
+    chg_crypt_tick(&bms, 999);
+    expect_eq("fresh 999", (unsigned)chg_crypt_bms_may_allow(&bms), 1);
+    expect_eq("fresh left", bms.peer_ms, 1u);
+    chg_crypt_tick(&bms, 1);
+    expect_eq("fresh expired", (unsigned)chg_crypt_bms_may_allow(&bms), 0);
+    expect_eq("fresh peer", bms.peer_ok, 0);
+    n = chg_crypt_pack_token(&chr, &w, f, sizeof f);
+    expect_eq("fresh again", (unsigned)chg_crypt_rx_frame(&bms, &w, f, (size_t)n), 1);
+    expect_eq("fresh restored", (unsigned)chg_crypt_bms_may_allow(&bms), 1);
+
+    arm(&bms, &chr, CHG_CRYPT_PORT_485, hmac, 1, 0);
+    hello_485(&bms, &chr, &w);
+    chg_crypt_set_ctrl(&bms, CTRL);
+    chg_crypt_set_ctrl(&chr, CTRL);
+    n = chg_crypt_pack_token(&bms, &w, f, sizeof f);
+    chg_crypt_rx_frame(&chr, &w, f, (size_t)n);
+    n = chg_crypt_pack_token(&chr, &w, f, sizeof f);
+    chg_crypt_rx_frame(&bms, &w, f, (size_t)n);
+    expect_eq("uni before", (unsigned)chg_crypt_bms_may_allow(&bms), 1);
+    chg_crypt_tick(&bms, 1000);
+    expect_eq("uni after", (unsigned)chg_crypt_bms_may_allow(&bms), 1);
+    expect_eq("uni peer dropped", bms.peer_ok, 0);
+}
+
 int main(void)
 {
     printf("sizeof ChgSha256 %lu\n", (unsigned long)sizeof(ChgSha256));
@@ -554,6 +682,7 @@ int main(void)
     test_can_and_ignore();
     test_replay_and_bat();
     test_pair();
+    test_salt_and_fresh();
     if (g_fail) {
         fprintf(stderr, "FAILED\n");
         return 1;

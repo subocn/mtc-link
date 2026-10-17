@@ -26,10 +26,10 @@
 2. 充电机用 `chg_crypt_rx_frame` 收下 `0x05`。选定套件要盐时，先 `chg_crypt_set_salt_chr`，再 `chg_crypt_pack_hello_chr`。80 ms 内只发这一帧，不发 `0x02`。
 3. BMS 用 `chg_crypt_rx_frame` 收下 `0x06`。
 4. 每一拍先 `chg_crypt_set_ctrl`，写入本拍 `0x01` 的 6 字节。已有 `0x04` 时调用 `chg_crypt_set_bat`，没有则传入空指针。这两次写入都会清掉上一枚已通过的 BMS 令牌。
-5. 套件 `0x01` 用 `chg_crypt_pack_token` 组出本方向的 `0x07`。接收方用 `chg_crypt_rx_frame` 核对。先写入第 4 步，再算标签。
-6. 充电机在 `chg_apply` 算出电流之后调用 `chg_crypt_bind_output`。它内部看 `chg_crypt_output_allowed`。不允许时，电流和使能都写成 0。
-7. BMS 在把允许位置 1 之前调用 `chg_crypt_bms_may_allow`。返回 0 就保持允许 = 0。已绑定，或要求双向盐时，要先收到充电机的令牌。
-8. 周期调用 `chg_crypt_tick(c, dt_ms)`。只有锁定期会把剩余的 10 s 减下去，减到 0 才回到空闲。
+5. 套件 `0x01` 用 `chg_crypt_pack_token` 组出本方向的 `0x07`。接收方用 `chg_crypt_rx_frame` 核对。先写入第 4 步，再算标签。令牌密钥由模块在第一次算标签时从长期密钥、两只盐和两只编号派生，调用方不填会话密钥。BMS 盐全 0 时 `chg_crypt_set_salt_bms` 不收下。非一线通上，套件需要盐而充电机盐全 0 时，`0x06` 组不出来。
+6. 充电机在 `chg_apply` 算出电流之后调用 `chg_crypt_bind_output`。它内部看 `chg_crypt_output_allowed`。不允许时，电流和使能都写成 0。电压上限和化学体系在 `chg_apply` 之后另判，见 5.7，不放宽这里的结果。
+7. BMS 在把允许位置 1 之前调用 `chg_crypt_bms_may_allow`。返回 0 就保持允许 = 0。已绑定，或要求双向盐时，要先收到充电机的令牌。这枚令牌超过 1000 ms 未再通过，返回值回到 0。
+8. 周期调用 `chg_crypt_tick(c, dt_ms)`。锁定期把剩余的 10 s 减下去，减到 0 才回到空闲。运行中，充电机令牌的 1000 ms 也在这里减。`tick(999)` 还留 1 ms，再 `tick(1)` 或一次 `tick(1000)` 则过期。
 
 CAN 用 `chg_crypt_can_split` 拆帧，用 `chg_crypt_can_rx` 拼回。标识符是 `0x181656F4` 和 `0x1816F456`。
 
@@ -45,15 +45,15 @@ CAN 用 `chg_crypt_can_split` 拆帧，用 `chg_crypt_can_rx` 拼回。标识符
 |------|------|
 | `ChgSha256` | 112 字节 |
 | `ChgMacWork` | 336 字节 |
-| `ChgCrypt` | 184 字节（64 位指针；32 位 MCU 上三只指针各少 4 字节） |
+| `ChgCrypt` | 208 字节（64 位指针；32 位 MCU 上三只指针各少 4 字节） |
 | SHA-256 目标文件 text | 1760 字节 |
-| 会话与组帧 text | 4920 字节 |
+| 会话与组帧 text | 6003 字节 |
 
-HMAC 这一条调用链上，各函数自己的栈大约是 112 + 64 + 16 字节。算上组帧，一条令牌的调用链大约 300 字节。大缓冲在 `ChgMacWork` 里，不在栈上。
+HMAC 这一条调用链上，各函数自己的栈大约是 mac_cover 96、hmac 112、sha_update 64、sha_block 16 字节。再加上组帧的 pack_token 96 字节，一条令牌大约 380 字节。派生和打标签两次 HMAC 先后执行，不叠成两份。大缓冲在 `ChgMacWork` 里，不在栈上。
 
 AES-128-CMAC、AES-GCM、ChaCha20-Poly1305 不进这幅映像。双方要这些算法时，用厂商套件号走钩子。
 
-长期密钥 16 字节只由调用方写入 `ChgCrypt`，组帧函数不从帧里读密钥。
+长期密钥 16 字节只由调用方写入 `ChgCrypt`，组帧函数不从帧里读密钥。会话密钥由模块写入，调用方不填。
 
 ## 测试
 
@@ -62,4 +62,4 @@ make -C chg_crypt test
 make -C chg_crypt size
 ```
 
-主机测试核对 SHA-256 与 HMAC-SHA256 的公开答案、57 字节标签、盐或 `0x04` 一变标签就变、明文可出流、标签失败或钩子失败时电流为 0、一线通要求双向盐时组不出握手、编号不一致或封条锁存时电流为 0、只有本地激活能清封条。未在实板上量过。
+主机测试核对 SHA-256 与 HMAC-SHA256 的公开答案、48 字节派生后再算 57 字节标签、盐或 `0x04` 一变标签就变、全 0 盐被拒绝、明文可出流、充电机令牌 1000 ms 后允许位回到 0、标签失败或钩子失败时电流为 0、一线通要求双向盐时组不出握手、编号不一致或封条锁存时电流为 0、只有本地激活能清封条。未在实板上量过。

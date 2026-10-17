@@ -30,6 +30,7 @@ typedef struct {
     uint16_t v_max_01v;
     uint16_t i_min_01a;
     uint16_t i_max_01a;
+    uint8_t  chemistry; /* 本机配置。不进 0x02。0 或 0xFF 未声明，1 三元，2 铁锂。 */
 } ChgCap;
 
 typedef struct {

@@ -535,6 +535,8 @@ static void test_bat_no_loss_refresh(void)
     static const uint8_t run[] = {
         0xA5, 0x5A, 0x01, 0x01, 0x06, 0x01, 0x48, 0x03, 0x90, 0x01, 0x00, 0x7C, 0x31};
 
+    /* 允许电压与最大电压同为 84.0 V。本用例只看 0x04 不改电流、不刷新丢失计时。 */
+    cap.v_max_01v = 840;
     chr_link_init(&link, CHG_PORT_SIF, &cap);
     chr_link_tick(&link, &st, 0, &tx);
     feed(&link, &st, run, sizeof run, &tx);
@@ -606,6 +608,8 @@ static void test_bat(void)
     expect_eq("flags reserved stripped",
               (unsigned)chg_bat_unpack(BAT_RESBITS, sizeof BAT_RESBITS, &info) == 35 && info.flags == 0, 1);
 
+    /* 与 0x04 的允许电压对齐，避免电压闸门混进「允许电流不改请求电流」。 */
+    cap.v_max_01v = 840;
     chr_link_init(&link, CHG_PORT_SIF, &cap);
     chr_link_tick(&link, &st, 0, &tx);
     expect_eq("no bat yet", chr_link_bat(&link, &info) != 0, 1);
@@ -720,6 +724,61 @@ static void test_bat(void)
         expect_eq("bat does not hold link", tx.phase, CHG_PHASE_HS);
         expect_eq("bat loss amps", tx.act.enable, 0);
     }
+}
+
+/* 最大电压高于允许电压，或两侧化学体系都已声明且不同：本周期输出 0，会话保持。 */
+static void test_bat_gate(void)
+{
+    ChrLink link;
+    ChrTx tx;
+    ChgCap cap = limits();
+    ChgStat st = meas();
+    static const uint8_t run[] = {
+        0xA5, 0x5A, 0x01, 0x01, 0x06, 0x01, 0x48, 0x03, 0x90, 0x01, 0x00, 0x7C, 0x31};
+    int i;
+
+    chr_link_init(&link, CHG_PORT_SIF, &cap);
+    chr_link_tick(&link, &st, 0, &tx);
+    feed(&link, &st, run, sizeof run, &tx);
+    feed(&link, &st, run, sizeof run, &tx);
+    feed(&link, &st, run, sizeof run, &tx);
+    expect_eq("gate before bat", tx.act.i_out_01a, 400);
+    feed(&link, &st, BAT_GOLDEN, sizeof BAT_GOLDEN, &tx);
+    expect_eq("gate volts", tx.act.i_out_01a, 0);
+    expect_eq("gate quiet", tx.act.enable, 0);
+    expect_eq("gate stays run", link.phase, CHG_PHASE_RUN);
+    for (i = 0; i < 4; i++) {
+        chr_link_tick(&link, &st, 800, &tx);
+        if (i < 3) {
+            feed(&link, &st, run, sizeof run, &tx);
+        }
+    }
+    expect_eq("gate stale back", tx.act.i_out_01a, 400);
+    expect_eq("gate stale on", tx.act.enable, 1);
+
+    cap.v_max_01v = 840;
+    cap.chemistry = CHG_CHEM_LFP;
+    chr_link_init(&link, CHG_PORT_SIF, &cap);
+    chr_link_tick(&link, &st, 0, &tx);
+    feed(&link, &st, run, sizeof run, &tx);
+    feed(&link, &st, run, sizeof run, &tx);
+    feed(&link, &st, run, sizeof run, &tx);
+    feed(&link, &st, BAT_GOLDEN, sizeof BAT_GOLDEN, &tx);
+    expect_eq("gate chem", tx.act.enable, 0);
+    expect_eq("gate chem run", link.phase, CHG_PHASE_RUN);
+    link.cap.chemistry = CHG_CHEM_NCM;
+    feed(&link, &st, run, sizeof run, &tx);
+    expect_eq("gate chem match", tx.act.i_out_01a, 400);
+
+    cap.chemistry = 0;
+    chr_link_init(&link, CHG_PORT_SIF, &cap);
+    chr_link_tick(&link, &st, 0, &tx);
+    feed(&link, &st, run, sizeof run, &tx);
+    feed(&link, &st, run, sizeof run, &tx);
+    feed(&link, &st, run, sizeof run, &tx);
+    feed(&link, &st, BAT_OTHER, sizeof BAT_OTHER, &tx);
+    expect_eq("gate unknown chem", tx.act.i_out_01a, 400);
+    expect_eq("gate allow ignored", link.bat.i_allow_01a, 10);
 }
 
 static void test_apply(void)
@@ -860,6 +919,7 @@ static void test_edges(void)
         0x02, 0x3B, 0x55};
 
     chr_link_init(&link, CHG_PORT_485, &cap);
+    link.cap.v_max_01v = 840; /* 与 cold 的允许电压相同，本段只看恒压位 */
     feed(&link, &st, cold, sizeof cold, &tx);
     expect_eq("cold before request", tx.act.enable, 0);
     expect_eq("cold no reply", tx.frame_len, 0);
@@ -1505,6 +1565,7 @@ int main(void)
     test_485();
     test_sif_off_drops_meter();
     test_bat();
+    test_bat_gate();
     test_bat_no_loss_refresh();
     test_pause_holds_ten_minutes();
     test_resume_fault_keeps_arm();
