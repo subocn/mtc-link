@@ -2,3 +2,4 @@ test_host
 e2e_host
 build/
 *.o
+*.su

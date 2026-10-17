@@ -46,10 +46,13 @@
 
 ## 现状
 
-实现在 `chg_bms`、`chg_charger`、`chg_link` 和 `e2e`。报文正文在 `doc/protocol.md`。现有代码只有 CRC-16，没有密钥和加密帧。加密和 `0x05` 起的认证报文尚未写入。
+报文实现在 `chg_bms`、`chg_charger`、`chg_link` 和 `e2e`。令牌在 `chg_crypt`。报文正文在 `doc/protocol.md`。
+
+`0x01`–`0x04` 的会话仍只做 CRC-16。启用 `chg_crypt` 后才发送 `0x05` 起的认证帧。套件 `0x01` 为无堆的 HMAC-SHA256，标签 8 字节。校验失败时输出保持 0。厂商算法不在本仓。
 
 ```bash
 make -C chg_bms test
 make -C chg_charger test
+make -C chg_crypt test
 make -C e2e test
 ```
