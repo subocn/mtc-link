@@ -133,6 +133,23 @@ static int sif_bidi_blocked(const ChgCrypt *c)
     return c->port == CHG_CRYPT_PORT_SIF && bidi_on(c);
 }
 
+static int sealed(const ChgCrypt *c)
+{
+    return c->seal || c->peer_seal;
+}
+
+/* 一对一绑定：对端编号必须与出厂写入的那一只相同，且不能走明文或一线通。 */
+static int bound_ok(const ChgCrypt *c)
+{
+    if (!c->pair_on) {
+        return 1;
+    }
+    if (c->port == CHG_CRYPT_PORT_SIF || c->suite == CHG_SUITE_PLAIN) {
+        return 0;
+    }
+    return memcmp(c->id_peer, c->pair_id, CHG_CRYPT_ID) == 0;
+}
+
 static int id_listed(const ChgCrypt *c)
 {
     uint8_t i;
@@ -246,6 +263,38 @@ void chg_crypt_set_allow(ChgCrypt *c, const uint8_t *ids, uint8_t n, uint8_t res
     c->restrict_id = restrict_id ? 1u : 0u;
 }
 
+void chg_crypt_factory_activate(ChgCrypt *c, const uint8_t key[CHG_CRYPT_KEY],
+                                const uint8_t peer_id[CHG_CRYPT_ID])
+{
+    if (c == 0 || key == 0 || peer_id == 0) {
+        return;
+    }
+    memcpy(c->key, key, CHG_CRYPT_KEY);
+    memcpy(c->pair_id, peer_id, CHG_CRYPT_ID);
+    c->pair_on = 1u;
+    c->seal = 0u;
+    c->peer_seal = 0u;
+    c->phase = CHG_CRYPT_PH_IDLE;
+    c->suite = CHG_SUITE_NONE;
+    c->token_ok = 0u;
+    c->peer_ok = 0u;
+    c->fails = 0u;
+    c->lock_ms = 0u;
+    c->rx_counter = 0u;
+    c->tx_counter = 0u;
+    asm_reset(c);
+}
+
+void chg_crypt_set_seal(ChgCrypt *c, uint8_t opened)
+{
+    if (c == 0 || opened == 0u) {
+        return;
+    }
+    c->seal = 1u;
+    c->token_ok = 0u;
+    c->peer_ok = 0u;
+}
+
 void chg_crypt_set_vendor(ChgCrypt *c, ChgCryptVendorFn fn, void *user)
 {
     if (c == 0) {
@@ -331,7 +380,7 @@ int chg_crypt_pack_hello_bms(ChgCrypt *c, uint8_t *out, size_t cap)
         return -1;
     }
     memset(data, 0, sizeof data);
-    data[0] = c->flags;
+    data[0] = (uint8_t)(c->flags | (c->seal ? CHG_CRYPT_F_SEAL : 0u));
     data[1] = c->suite_n == 0u ? 1u : c->suite_n;
     if (c->suite_n == 0u) {
         data[2] = CHG_SUITE_PLAIN;
@@ -378,7 +427,7 @@ int chg_crypt_pack_hello_chr(ChgCrypt *c, uint8_t *out, size_t cap)
         return -1;
     }
     memset(data, 0, sizeof data);
-    data[0] = c->flags;
+    data[0] = (uint8_t)(c->flags | (c->seal ? CHG_CRYPT_F_SEAL : 0u));
     data[1] = c->suite;
     if (c->salt_chr_set) {
         memcpy(data + 2, c->salt_chr, CHG_CRYPT_SALT);
@@ -458,7 +507,7 @@ static int on_hello_bms(ChgCrypt *c, const uint8_t *data, uint8_t len)
     if (len != 22u) {
         return -1;
     }
-    if ((data[0] & ~(CHG_CRYPT_F_PLAIN | CHG_CRYPT_F_BIDI)) != 0u) {
+    if ((data[0] & ~(CHG_CRYPT_F_PLAIN | CHG_CRYPT_F_BIDI | CHG_CRYPT_F_SEAL)) != 0u) {
         return -1;
     }
     n = data[1];
@@ -470,7 +519,8 @@ static int on_hello_bms(ChgCrypt *c, const uint8_t *data, uint8_t len)
             return -1;
         }
     }
-    c->peer_flags = data[0];
+    c->peer_flags = (uint8_t)(data[0] & (CHG_CRYPT_F_PLAIN | CHG_CRYPT_F_BIDI));
+    c->peer_seal = (data[0] & CHG_CRYPT_F_SEAL) ? 1u : 0u;
     memcpy(c->salt_bms, data + 6, CHG_CRYPT_SALT);
     c->salt_bms_set = 1u;
     memcpy(c->id_peer, data + 14, CHG_CRYPT_ID);
@@ -504,12 +554,13 @@ static int on_hello_chr(ChgCrypt *c, const uint8_t *data, uint8_t len)
     if (c->phase != CHG_CRYPT_PH_WAIT || len != 18u) {
         return -1;
     }
-    if ((data[0] & ~(CHG_CRYPT_F_PLAIN | CHG_CRYPT_F_BIDI)) != 0u) {
+    if ((data[0] & ~(CHG_CRYPT_F_PLAIN | CHG_CRYPT_F_BIDI | CHG_CRYPT_F_SEAL)) != 0u) {
         return -1;
     }
-    peer_flags = data[0];
+    peer_flags = (uint8_t)(data[0] & (CHG_CRYPT_F_PLAIN | CHG_CRYPT_F_BIDI));
     chosen = data[1];
     c->peer_flags = peer_flags;
+    c->peer_seal = (data[0] & CHG_CRYPT_F_SEAL) ? 1u : 0u;
     memcpy(c->salt_chr, data + 2, CHG_CRYPT_SALT);
     c->salt_chr_set = 1u;
     memcpy(c->id_peer, data + 10, CHG_CRYPT_ID);
@@ -792,7 +843,7 @@ int chg_crypt_can_rx(ChgCrypt *c, ChgMacWork *w, const ChgCan *f)
 
 int chg_crypt_output_allowed(const ChgCrypt *c)
 {
-    if (!session_open(c)) {
+    if (!session_open(c) || sealed(c) || !bound_ok(c)) {
         return 0;
     }
     if (c->suite == CHG_SUITE_PLAIN) {
@@ -809,7 +860,10 @@ int chg_crypt_output_allowed(const ChgCrypt *c)
 
 int chg_crypt_bms_may_allow(const ChgCrypt *c)
 {
-    if (!session_open(c) || c->role != CHG_CRYPT_ROLE_BMS) {
+    if (!session_open(c) || c->role != CHG_CRYPT_ROLE_BMS || sealed(c) || !bound_ok(c)) {
+        return 0;
+    }
+    if (c->pair_on && !c->peer_ok) {
         return 0;
     }
     if (c->suite == CHG_SUITE_PLAIN) {

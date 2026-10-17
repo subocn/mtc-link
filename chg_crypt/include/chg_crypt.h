@@ -27,6 +27,7 @@
 
 #define CHG_CRYPT_F_PLAIN 0x01u /* 无共同套件时允许明文 */
 #define CHG_CRYPT_F_BIDI  0x02u /* 要求充电机也出盐。一线通完不成 */
+#define CHG_CRYPT_F_SEAL  0x04u /* 本机封条已断开。只报告，充电帧不能把它清掉 */
 
 #define CHG_CRYPT_KEY 16u
 #define CHG_CRYPT_SALT 8u
@@ -100,12 +101,16 @@ typedef struct {
     uint8_t salt_chr_set;
     uint8_t have_ctrl;
     uint8_t have_bat;
+    uint8_t pair_on;     /* 1：只接受 pair_id 这一只对端 */
+    uint8_t seal;        /* 1：本机封条已断开，掉电也要由产品记住 */
+    uint8_t peer_seal;   /* 对端 hello 带来的封条 */
     uint8_t asm_mask;
     uint8_t key[CHG_CRYPT_KEY];
     uint8_t salt_bms[CHG_CRYPT_SALT];
     uint8_t salt_chr[CHG_CRYPT_SALT];
     uint8_t id_self[CHG_CRYPT_ID];
     uint8_t id_peer[CHG_CRYPT_ID];
+    uint8_t pair_id[CHG_CRYPT_ID];
     uint8_t suites[4];
     uint8_t ctrl[CHG_CRYPT_CTRL];
     uint8_t bat[CHG_CRYPT_BAT];
@@ -124,6 +129,16 @@ void chg_crypt_init(ChgCrypt *c, uint8_t role, uint8_t port,
 
 /* restrict_id 为 1 时，名单为空视为拒绝。明文会话不把编号当作身份证明。 */
 void chg_crypt_set_allow(ChgCrypt *c, const uint8_t *ids, uint8_t n, uint8_t restrict_id);
+
+/* 出厂或检修的本地写入。充电口上的任何帧都不会调用它。
+ * 写入长期密钥和唯一对端编号，并清除本机封条锁存。调用后会话回到空闲，要重新握手。
+ * 产品把封条锁存放在掉电仍在的存储里：上电时若已断开则调用 chg_crypt_set_seal(c, 1)。
+ * 只有这条写入可以清掉锁存。 */
+void chg_crypt_factory_activate(ChgCrypt *c, const uint8_t key[CHG_CRYPT_KEY],
+                                const uint8_t peer_id[CHG_CRYPT_ID]);
+
+/* opened 非 0：锁存封条断开，允许位和出流都保持关闭。opened 为 0 时不清除。 */
+void chg_crypt_set_seal(ChgCrypt *c, uint8_t opened);
 void chg_crypt_set_vendor(ChgCrypt *c, ChgCryptVendorFn fn, void *user);
 void chg_crypt_set_salt_bms(ChgCrypt *c, const uint8_t salt[CHG_CRYPT_SALT]);
 void chg_crypt_set_salt_chr(ChgCrypt *c, const uint8_t salt[CHG_CRYPT_SALT]);

@@ -435,6 +435,110 @@ static void test_replay_and_bat(void)
     expect_eq("bat changes tag", memcmp(f + 10, f2 + 10, 8) != 0, 1);
 }
 
+static void open_pair(ChgCrypt *bms, ChgCrypt *chr, ChgMacWork *w)
+{
+    uint8_t f[40];
+    int n;
+    hello_485(bms, chr, w);
+    chg_crypt_set_ctrl(bms, CTRL);
+    chg_crypt_set_ctrl(chr, CTRL);
+    n = chg_crypt_pack_token(bms, w, f, sizeof f);
+    chg_crypt_rx_frame(chr, w, f, (size_t)n);
+    n = chg_crypt_pack_token(chr, w, f, sizeof f);
+    chg_crypt_rx_frame(bms, w, f, (size_t)n);
+}
+
+static void test_pair(void)
+{
+    ChgCrypt bms, chr;
+    ChgMacWork w;
+    uint8_t suites[] = {CHG_SUITE_HMAC};
+    uint8_t wrong[8] = {0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE};
+    uint8_t f[48];
+    uint16_t i = 300;
+    uint8_t en = 1;
+    int n;
+
+    arm(&bms, &chr, CHG_CRYPT_PORT_485, suites, 1, CHG_CRYPT_F_BIDI);
+    chg_crypt_factory_activate(&bms, KEY, ID_CHR);
+    chg_crypt_factory_activate(&chr, KEY, ID_BMS);
+    chg_crypt_set_salt_bms(&bms, SALT_BMS);
+    chg_crypt_set_salt_chr(&chr, SALT_CHR);
+    open_pair(&bms, &chr, &w);
+    expect_eq("pair out", (unsigned)chg_crypt_output_allowed(&chr), 1);
+    expect_eq("pair bms", (unsigned)chg_crypt_bms_may_allow(&bms), 1);
+    chg_crypt_bind_output(&chr, &i, &en);
+    expect_eq("pair amps", i, 300);
+
+    arm(&bms, &chr, CHG_CRYPT_PORT_485, suites, 1, CHG_CRYPT_F_BIDI);
+    chg_crypt_factory_activate(&bms, KEY, ID_CHR);
+    chg_crypt_factory_activate(&chr, KEY, wrong);
+    chg_crypt_set_salt_bms(&bms, SALT_BMS);
+    chg_crypt_set_salt_chr(&chr, SALT_CHR);
+    open_pair(&bms, &chr, &w);
+    i = 300;
+    en = 1;
+    chg_crypt_bind_output(&chr, &i, &en);
+    expect_eq("swap charger amps", i, 0);
+    expect_eq("swap charger out", (unsigned)chg_crypt_output_allowed(&chr), 0);
+
+    arm(&bms, &chr, CHG_CRYPT_PORT_485, suites, 1, CHG_CRYPT_F_BIDI);
+    chg_crypt_factory_activate(&bms, KEY, wrong);
+    chg_crypt_factory_activate(&chr, KEY, ID_BMS);
+    chg_crypt_set_salt_bms(&bms, SALT_BMS);
+    chg_crypt_set_salt_chr(&chr, SALT_CHR);
+    open_pair(&bms, &chr, &w);
+    expect_eq("swap pack bms", (unsigned)chg_crypt_bms_may_allow(&bms), 0);
+
+    arm(&bms, &chr, CHG_CRYPT_PORT_485, suites, 1, CHG_CRYPT_F_BIDI);
+    chg_crypt_factory_activate(&bms, KEY, ID_CHR);
+    chg_crypt_factory_activate(&chr, KEY, ID_BMS);
+    chg_crypt_set_salt_bms(&bms, SALT_BMS);
+    chg_crypt_set_salt_chr(&chr, SALT_CHR);
+    open_pair(&bms, &chr, &w);
+    chg_crypt_set_seal(&chr, 1);
+    chg_crypt_set_seal(&chr, 0);
+    i = 300;
+    en = 1;
+    chg_crypt_bind_output(&chr, &i, &en);
+    expect_eq("seal holds", chr.seal, 1);
+    expect_eq("seal amps", i, 0);
+    n = chg_crypt_pack_token(&bms, &w, f, sizeof f);
+    chg_crypt_set_ctrl(&chr, CTRL);
+    chg_crypt_rx_frame(&chr, &w, f, (size_t)n);
+    expect_eq("frame keeps seal", chr.seal, 1);
+    expect_eq("frame still closed", (unsigned)chg_crypt_output_allowed(&chr), 0);
+
+    chg_crypt_set_seal(&bms, 1);
+    n = chg_crypt_pack_hello_bms(&bms, f, sizeof f);
+    expect_eq("seal bit", (unsigned)(f[5] & CHG_CRYPT_F_SEAL), CHG_CRYPT_F_SEAL);
+    expect_eq("peer sees seal", (unsigned)chg_crypt_rx_frame(&chr, &w, f, (size_t)n), 1);
+    expect_eq("peer seal", chr.peer_seal, 1);
+
+    chg_crypt_factory_activate(&bms, KEY, ID_CHR);
+    chg_crypt_factory_activate(&chr, KEY, ID_BMS);
+    expect_eq("factory clears seal", chr.seal, 0);
+    expect_eq("factory idle", chr.phase, CHG_CRYPT_PH_IDLE);
+    chg_crypt_set_salt_bms(&bms, SALT_BMS);
+    chg_crypt_set_salt_chr(&chr, SALT_CHR);
+    open_pair(&bms, &chr, &w);
+    expect_eq("reactivated", (unsigned)chg_crypt_output_allowed(&chr), 1);
+
+    arm(&bms, &chr, CHG_CRYPT_PORT_SIF, suites, 1, 0);
+    chg_crypt_factory_activate(&bms, KEY, ID_CHR);
+    chg_crypt_factory_activate(&chr, KEY, ID_BMS);
+    chg_crypt_set_salt_bms(&bms, SALT_BMS);
+    n = chg_crypt_pack_hello_bms(&bms, f, sizeof f);
+    expect_eq("sif pair hello", n > 0, 1);
+    chg_crypt_rx_frame(&chr, &w, f, (size_t)n);
+    chg_crypt_set_ctrl(&bms, CTRL);
+    chg_crypt_set_ctrl(&chr, CTRL);
+    n = chg_crypt_pack_token(&bms, &w, f, sizeof f);
+    chg_crypt_rx_frame(&chr, &w, f, (size_t)n);
+    expect_eq("sif pair out", (unsigned)chg_crypt_output_allowed(&chr), 0);
+    expect_eq("sif pair bms", (unsigned)chg_crypt_bms_may_allow(&bms), 0);
+}
+
 int main(void)
 {
     printf("sizeof ChgSha256 %lu\n", (unsigned long)sizeof(ChgSha256));
@@ -449,6 +553,7 @@ int main(void)
     test_vendor();
     test_can_and_ignore();
     test_replay_and_bat();
+    test_pair();
     if (g_fail) {
         fprintf(stderr, "FAILED\n");
         return 1;
