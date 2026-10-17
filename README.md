@@ -1,5 +1,7 @@
 # mtc-link
 
+作者：苏勃(subo)
+
 电摩充电机与电池管理系统（BMS）的通信基础。`mtc-solo`、`mtc-dock`、`mtc-meter`、`mtc-pile-sim` 和 `mtc-crypt` 都依赖本仓。本仓不依赖它们。
 
 本仓先私有。报文和主机测试稳定后，按个人项目公开。公开文本不出现公司、客户、供应商、价格、料号和具体机型。
@@ -44,4 +46,10 @@
 
 ## 现状
 
-仓还没从工作仓拆出。可迁入的实现是工作仓里 `firmware/chg_bms` 和 `firmware/chg_charger` 中与这四条报文、三个口有关的部分。现有代码只有 CRC-16，没有密钥和加密帧。加密、`0x05` 起的认证报文和电气匹配闸门在本仓新写。迁入时去掉文件头里的个人署名、公司、客户和文件编号。
+实现在 `chg_bms`、`chg_charger`、`chg_link` 和 `e2e`。报文正文在 `doc/protocol.md`。现有代码只有 CRC-16，没有密钥和加密帧。加密和 `0x05` 起的认证报文尚未写入。
+
+```bash
+make -C chg_bms test
+make -C chg_charger test
+make -C e2e test
+```

@@ -1,0 +1,811 @@
+/* 作者：苏勃(subo)*/
+#include "chg_charger.h"
+
+#include <string.h>
+
+#define T_SLOW_MS 250u
+#define T_FAST_MS 50u
+#define T_LINE_DOWN_MS 100u  /* §10 验收 15: SIF 拉低 / CAN bus-off / 485 短路 */
+#define T_GAP_MS 50u
+
+static uint16_t crc16(const uint8_t *data, size_t len)
+{
+    uint16_t crc = 0xFFFFu;
+    size_t i;
+    int b;
+
+    for (i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (b = 0; b < 8; b++) {
+            if (crc & 1u) {
+                crc = (uint16_t)((crc >> 1) ^ 0xA001u);
+            } else {
+                crc = (uint16_t)(crc >> 1);
+            }
+        }
+    }
+    return crc;
+}
+
+static void put_u16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static uint16_t get_u16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static int frame_pack(uint8_t msg, const uint8_t *data, uint8_t len, uint8_t *out, size_t cap)
+{
+    uint16_t crc;
+    if (out == 0 || (len > 0u && data == 0) || cap < (size_t)len + 7u) {
+        return -1;
+    }
+    out[0] = 0xA5;
+    out[1] = 0x5A;
+    out[2] = 0x01;
+    out[3] = msg;
+    out[4] = len;
+    if (len > 0u) {
+        memcpy(out + 5, data, len);
+    }
+    crc = crc16(out, (size_t)len + 5u);
+    out[5 + len] = (uint8_t)(crc & 0xFFu);
+    out[6 + len] = (uint8_t)(crc >> 8);
+    return (int)len + 7;
+}
+
+static int frame_unpack(const uint8_t *in, size_t n, uint8_t *msg, uint8_t *data, uint8_t *len)
+{
+    uint8_t l;
+    uint16_t crc;
+    uint16_t got;
+    if (in == 0 || msg == 0 || len == 0 || n < 7u) {
+        return -1;
+    }
+    if (in[0] != 0xA5u || in[1] != 0x5Au || in[2] != 0x01u) {
+        return -1;
+    }
+    l = in[4];
+    if (n < (size_t)l + 7u) {
+        return -1;
+    }
+    crc = crc16(in, (size_t)l + 5u);
+    got = (uint16_t)(in[5 + l] | ((uint16_t)in[6 + l] << 8));
+    if (crc != got) {
+        return -1;
+    }
+    *msg = in[3];
+    *len = l;
+    if (l > 0u) {
+        if (data == 0) {
+            return -1;
+        }
+        memcpy(data, in + 5, l);
+    }
+    return (int)l + 7;
+}
+
+static void store_cap(const ChgCap *c, uint8_t data[9])
+{
+    data[0] = c->ready ? 0x01u : 0u;
+    put_u16(data + 1, c->v_min_01v);
+    put_u16(data + 3, c->v_max_01v);
+    put_u16(data + 5, c->i_min_01a);
+    put_u16(data + 7, c->i_max_01a);
+}
+
+static void store_stat(const ChgStat *s, uint8_t data[6])
+{
+    data[0] = (uint8_t)((s->outputting ? 0x01u : 0u) | (s->fault ? 0x02u : 0u) |
+                        (s->ac_path ? 0x04u : 0u) | (s->dc_path ? 0x08u : 0u));
+    put_u16(data + 1, s->v_out_01v);
+    put_u16(data + 3, s->i_out_01a);
+    data[5] = s->fault_code;
+}
+
+int chg_cap_pack(const ChgCap *c, uint8_t *out, size_t cap)
+{
+    uint8_t data[9];
+    if (c == 0) {
+        return -1;
+    }
+    store_cap(c, data);
+    return frame_pack(0x02u, data, 9, out, cap);
+}
+
+static int load_bat(const uint8_t data[28], ChgBat *b)
+{
+    /* 有效字节只认 0x00 和 0x01。其他值整帧无效，不覆盖已保存的电池信息。 */
+    if (data[0] != 0x00u && data[0] != 0x01u) {
+        return -1;
+    }
+    memset(b, 0, sizeof *b);
+    b->valid = data[0];
+    b->flags = (uint8_t)(data[1] & 0x3Fu);
+    b->soc_01pct = get_u16(data + 2);
+    b->v_pack_01v = get_u16(data + 4);
+    b->v_cell_max_mv = get_u16(data + 6);
+    b->v_cell_min_mv = get_u16(data + 8);
+    b->t_max_c = (int8_t)data[10];
+    b->t_min_c = (int8_t)data[11];
+    b->rated_ah_01ah = get_u16(data + 12);
+    b->rated_v_01v = get_u16(data + 14);
+    b->chemistry = data[16];
+    b->v_allow_01v = get_u16(data + 17);
+    b->i_allow_01a = get_u16(data + 19);
+    b->t_allow_c = (int8_t)data[21];
+    b->remain_min = get_u16(data + 22);
+    b->idx_cell_max = data[24];
+    b->idx_cell_min = data[25];
+    b->idx_temp_max = data[26];
+    b->idx_temp_min = data[27];
+    return 0;
+}
+
+int chg_bat_unpack(const uint8_t *in, size_t n, ChgBat *b)
+{
+    uint8_t msg = 0;
+    uint8_t data[28];
+    uint8_t len = 0;
+    if (frame_unpack(in, n, &msg, data, &len) <= 0 || msg != 0x04u || len != 28u) {
+        return -1;
+    }
+    if (b != 0 && load_bat(data, b) != 0) {
+        return -1;
+    }
+    if (b == 0) {
+        ChgBat tmp;
+        if (load_bat(data, &tmp) != 0) {
+            return -1;
+        }
+    }
+    return 35;
+}
+
+int chg_stat_pack(const ChgStat *s, uint8_t *out, size_t cap)
+{
+    uint8_t data[6];
+    if (s == 0) {
+        return -1;
+    }
+    store_stat(s, data);
+    return frame_pack(0x03u, data, 6, out, cap);
+}
+
+static int load_ctrl(const uint8_t data[6], ChgCtrl *c)
+{
+    if (data == 0 || c == 0) {
+        return -1;
+    }
+    /* 字节 0 的高 4 位和字节 5 是保留，必须为 0。非 0 整帧无效。 */
+    if ((data[0] & 0xF0u) != 0u || data[5] != 0u) {
+        return -1;
+    }
+    c->allow = (uint8_t)((data[0] & 0x01u) != 0u);
+    c->pause = (uint8_t)((data[0] & 0x02u) != 0u);
+    c->stop = (uint8_t)((data[0] & 0x04u) != 0u);
+    c->cv = (uint8_t)((data[0] & 0x08u) != 0u);
+    c->v_req_01v = get_u16(data + 1);
+    c->i_req_01a = get_u16(data + 3);
+    return 0;
+}
+
+static uint16_t can_i_raw(uint16_t i_01a)
+{
+    /* 大于 6153.5 A 时停在 65535，避免加 4000 后回绕成小电流。 */
+    if (i_01a > 65535u - 4000u) {
+        return 65535u;
+    }
+    return (uint16_t)(i_01a + 4000u);
+}
+
+static uint16_t can_i_phys(uint16_t raw)
+{
+    if (raw < 4000u) {
+        return 0;
+    }
+    return (uint16_t)(raw - 4000u);
+}
+
+static void can_clear(ChgCan *f)
+{
+    memset(f, 0, sizeof *f);
+}
+
+void chg_can_cml(const ChgCap *c, ChgCan *f)
+{
+    can_clear(f);
+    f->id = CHG_CAN_CML;
+    f->dlc = 8;
+    put_u16(f->data, c->v_max_01v);
+    put_u16(f->data + 2, c->v_min_01v);
+    put_u16(f->data + 4, can_i_raw(c->i_max_01a));
+    put_u16(f->data + 6, can_i_raw(c->i_min_01a));
+}
+
+void chg_can_cro(uint8_t ready, ChgCan *f)
+{
+    can_clear(f);
+    f->id = CHG_CAN_CRO;
+    f->dlc = 1;
+    f->data[0] = ready ? 0xAAu : 0x00u;
+}
+
+void chg_can_ccs(const ChgStat *s, ChgCan *f)
+{
+    can_clear(f);
+    f->id = CHG_CAN_CCS;
+    /* §12.2 CCS 8 字节：byte 0..1 v_out、2..3 i_out(物理+400)、4 累计时间 (0.1 min/bit, 实时帧写 0 见 CEM)、
+     * 5 充电机状态 bit0=outputting(功率级已闭合)、6 故障位(1=无故障)、7 累计能量 0.1 kWh/bit(实时帧写 0 见 CEM)。 */
+    f->dlc = 8;
+    put_u16(f->data, s->v_out_01v);
+    put_u16(f->data + 2, can_i_raw(s->i_out_01a));
+    f->data[4] = 0x00u;     /* 实时帧不累计，会话级累计由 §12.2 CEM 在 ENDING 一次性发 */
+    f->data[5] = s->outputting ? 0x01u : 0x00u;  /* v28: byte 5 outputting 位，与 chg_evcc.c:276 对齐 */
+    f->data[6] = (s->fault || s->fault_code) ? 0x00u : 0x01u;
+    f->data[7] = 0x00u;     /* §12.2: 累计能量 0.1 kWh/bit，实时帧写 0，见 CEM.energy */
+}
+
+void chg_can_cst(ChgCan *f)
+{
+    can_clear(f);
+    f->id = CHG_CAN_CST;
+    f->dlc = 4;
+    f->data[0] = 0x01;
+}
+
+void chg_apply(const ChgCtrl *ctrl, const ChgCap *cap, uint8_t cap_valid, uint8_t link_ok,
+               uint8_t paths_conflict, uint8_t charger_fault, ChgAct *act)
+{
+    uint16_t i;
+    uint16_t v;
+    if (act == 0) {
+        return;
+    }
+    act->i_out_01a = 0;
+    act->v_target_01v = 0;
+    act->enable = 0;
+    if (ctrl == 0 || cap == 0 || !link_ok || paths_conflict || charger_fault) {
+        return;
+    }
+    if (ctrl->pause || ctrl->stop || !ctrl->allow || ctrl->i_req_01a == 0u || ctrl->v_req_01v == 0u) {
+        return;
+    }
+    if (cap_valid && !cap->ready) {
+        return;
+    }
+    i = ctrl->i_req_01a;
+    v = ctrl->v_req_01v;
+    if (i > cap->i_max_01a) {
+        i = cap->i_max_01a;
+    }
+    if (v > cap->v_max_01v) {
+        v = cap->v_max_01v;
+    }
+    if (i == 0u || v == 0u) {
+        return;
+    }
+    act->i_out_01a = i;
+    act->v_target_01v = v;
+    act->enable = 1;
+}
+
+static int due(uint32_t *acc, uint32_t dt, uint32_t period, uint8_t *arm)
+{
+    if (*arm == 0u) {
+        *arm = 1u;
+        *acc = 0;
+        return 1;
+    }
+    *acc += dt;
+    if (*acc >= period) {
+        *acc %= period;
+        return 1;
+    }
+    return 0;
+}
+
+static void push_can(ChrTx *tx, const ChgCan *f)
+{
+    if (tx->can_n < 3u) {
+        tx->can[tx->can_n++] = *f;
+    }
+}
+
+static void enter_stop(ChrLink *l)
+{
+    l->phase = CHG_PHASE_STOP;
+    l->advertise_ready = 0u;
+    l->seen_allow0 = 0u;
+    l->sif_got = 0u;
+    l->have_ctrl = 0u;
+    l->link_ok = 0u;
+    memset(&l->ctrl, 0, sizeof l->ctrl);
+}
+
+static void latch_line_fault(ChrLink *l)
+{
+    enter_stop(l);
+    l->line_fault = 1u;
+    l->raw_n = 0u;
+}
+
+/* down=1 累加到 100 ms 后锁存。down=0 解除锁存，会话仍留在 STOP，
+ * 等下一次握手，不在本函数里恢复出流。 */
+static void observe_line(ChrLink *l, uint8_t down, uint32_t dt_ms)
+{
+    if (down) {
+        if (l->line_down_ms < 0xFFFFFFFFu - dt_ms) {
+            l->line_down_ms += dt_ms;
+        }
+        if (l->line_down_ms >= T_LINE_DOWN_MS) {
+            latch_line_fault(l);
+        }
+    } else {
+        l->line_down_ms = 0u;
+        l->line_fault = 0u;
+    }
+}
+
+void chr_link_set_aux_uv(ChrLink *l, uint8_t aux_undervolt, uint32_t dt_ms)
+{
+    if (l == 0) {
+        return;
+    }
+    if (aux_undervolt) {
+        if (l->aux_uv_ms < 0xFFFFFFFFu - dt_ms) {
+            l->aux_uv_ms += dt_ms;
+        }
+        if (l->aux_uv_ms >= 100u) {
+            enter_stop(l);
+            l->aux_fault = 1u;
+        }
+    } else {
+        l->aux_uv_ms = 0u;
+        l->aux_fault = 0u;
+    }
+}
+
+void chr_link_set_sif_state(ChrLink *l, uint8_t b, uint32_t dt_ms)
+{
+    if (l == 0 || l->port != CHG_PORT_SIF) {
+        return;
+    }
+    observe_line(l, (uint8_t)(b == 0u), dt_ms);
+}
+
+void chr_link_set_bus_off(ChrLink *l, uint8_t bus_off, uint32_t dt_ms)
+{
+    if (l == 0 || l->port != CHG_PORT_CAN) {
+        return;
+    }
+    observe_line(l, bus_off ? 1u : 0u, dt_ms);
+}
+
+void chr_link_set_485_short(ChrLink *l, uint8_t shorted, uint32_t dt_ms)
+{
+    if (l == 0 || l->port != CHG_PORT_485) {
+        return;
+    }
+    observe_line(l, shorted ? 1u : 0u, dt_ms);
+}
+
+static void begin_handshake(ChrLink *l)
+{
+    l->phase = CHG_PHASE_HS;
+    l->advertise_ready = 0u;
+    l->seen_allow0 = 0u;
+    l->sif_got = 0u;
+    l->have_ctrl = 0u;
+    l->cap_dirty = 1u;
+    l->loss_ms = 0;
+    l->link_ok = 0u;
+    memset(&l->ctrl, 0, sizeof l->ctrl);
+}
+
+static void output_of(ChrLink *l, const ChgStat *meas, ChrTx *tx, int consume_resume)
+{
+    uint8_t conflict = (uint8_t)(meas != 0 && meas->ac_path && meas->dc_path);
+    uint8_t fault = (uint8_t)(meas != 0 && (meas->fault || meas->fault_code != 0u));
+    uint8_t link = (uint8_t)(l->link_ok && l->phase == CHG_PHASE_RUN);
+    uint8_t cap_valid = (uint8_t)(l->port != CHG_PORT_SIF);
+    ChgCap cap = l->cap;
+    cap.ready = l->advertise_ready;
+    chg_apply(l->have_ctrl ? &l->ctrl : 0, &cap, cap_valid, link, conflict, fault, &tx->act);
+    /* GB/T 18487.1-2023 10.7.2：直流接触器再次闭合时冲击电流峰值不超过 20 A。
+     * 暂停恢复的第一拍把电流钳在 20.0 A，电压目标取接口电压减 1 V。 */
+    if (l->resume_arm && tx->act.enable) {
+        if (tx->act.i_out_01a > 200u) {
+            tx->act.i_out_01a = 200u;
+        }
+        if (tx->act.v_target_01v > 10u) {
+            tx->act.v_target_01v = (uint16_t)(tx->act.v_target_01v - 10u);
+        }
+        /* 置位一直保留到周期 tick。接收函数里的输出也先钳住，避免调用方用到未钳电流。
+         * 故障拍 enable 为 0，不会进到这里，置位保留到故障消失后的第一拍。 */
+        if (consume_resume) {
+            l->resume_arm = 0u;
+        }
+    }
+    tx->phase = l->phase;
+    tx->link_ok = l->link_ok;
+}
+
+static void note_ctrl(ChrLink *l, const ChgCtrl *c, int from_can_bcl_only)
+{
+    uint8_t was_pause = l->ctrl.pause;
+    l->ctrl = *c;
+    l->have_ctrl = 1u;
+    l->loss_ms = 0;
+    l->link_ok = 1u;
+    /* 握手帧就是允许=0、电流=0。只有能量传输阶段的电流 0，或停止位，才结束会话。 */
+    if (c->stop || (l->phase == CHG_PHASE_RUN && !from_can_bcl_only && c->i_req_01a == 0u)) {
+        enter_stop(l);
+        return;
+    }
+    if (l->phase == CHG_PHASE_STOP || l->phase == CHG_PHASE_OFF) {
+        begin_handshake(l);
+        l->ctrl = *c;
+        l->have_ctrl = 1u;
+        l->link_ok = 1u;
+    }
+    if (l->phase == CHG_PHASE_HS && c->allow == 0u) {
+        l->seen_allow0 = 1u;
+        if (l->port != CHG_PORT_SIF) {
+            l->advertise_ready = 1u;
+            l->cap_dirty = 1u;
+        }
+    }
+    if (was_pause && c->pause == 0u && l->phase == CHG_PHASE_RUN) {
+        /* 私有链路不因暂停时长结束会话。满 10 min 发 CST 只在桩侧。 */
+        l->resume_arm = 1u;
+    }
+    if (l->port == CHG_PORT_SIF && l->phase == CHG_PHASE_HS) {
+        if (l->sif_got < 3u) {
+            l->sif_got++;
+        }
+        if (l->sif_got >= 3u) {
+            l->phase = CHG_PHASE_RUN;
+            l->advertise_ready = 1u;
+        }
+    }
+    if (l->phase == CHG_PHASE_HS && l->port != CHG_PORT_SIF && l->seen_allow0 && c->allow) {
+        l->phase = CHG_PHASE_RUN;
+    }
+}
+
+static int remember_bat(ChrLink *l, const uint8_t data[28])
+{
+    ChgBat bat;
+    if (load_bat(data, &bat) != 0) {
+        l->rx_drop++;
+        return -1;
+    }
+    l->bat = bat;
+    l->bat_seen = 1u;
+    l->bat_age_ms = 0;
+    return 0;
+}
+
+int chr_link_bat(const ChrLink *l, ChgBat *out)
+{
+    if (out != 0) {
+        memset(out, 0, sizeof *out);
+    }
+    if (l == 0 || l->bat_seen == 0u || l->bat.valid == 0u || l->bat_age_ms > CHG_BAT_STALE_MS) {
+        return -1;
+    }
+    if (out != 0) {
+        *out = l->bat;
+    }
+    return 0;
+}
+
+void chr_link_init(ChrLink *l, uint8_t port, const ChgCap *cap)
+{
+    memset(l, 0, sizeof *l);
+    l->port = port;
+    l->phase = CHG_PHASE_OFF;
+    if (cap != 0) {
+        l->cap = *cap;
+    }
+    l->cap.ready = 0u;
+    l->cap_dirty = 1u;
+}
+
+void chr_link_tick(ChrLink *l, const ChgStat *meas, uint32_t dt_ms, ChrTx *tx)
+{
+    int slow;
+    int fast;
+    uint8_t mute_tx = 0u;
+    ChgCan f;
+    ChgCap advertised;
+    ChgStat none;
+
+    if (tx == 0) {
+        return;
+    }
+    memset(tx, 0, sizeof *tx);
+    if (l == 0 || (l->port != CHG_PORT_SIF && l->port != CHG_PORT_CAN && l->port != CHG_PORT_485)) {
+        return;
+    }
+    memset(&none, 0, sizeof none);
+    if (meas == 0) {
+        meas = &none;
+    }
+    if (l->bat_age_ms > 0xFFFFFFFFu - dt_ms) {
+        l->bat_age_ms = 0xFFFFFFFFu;
+    } else {
+        l->bat_age_ms += dt_ms;
+    }
+    if (l->line_fault || l->aux_fault) {
+        /* 线还断着，或辅助电源仍欠压：停在 STOP，不开上拉，本拍不发就绪。 */
+        l->phase = CHG_PHASE_STOP;
+        l->link_ok = 0u;
+        l->advertise_ready = 0u;
+        mute_tx = 1u;
+    } else if (l->phase == CHG_PHASE_OFF) {
+        begin_handshake(l);
+    } else if (l->phase == CHG_PHASE_RUN) {
+        l->loss_ms += dt_ms;
+        if (l->port == CHG_PORT_CAN && l->bcl_seen) {
+            l->bcl_gap_ms += dt_ms;
+            if (l->bcl_gap_ms > 50u + 5u) {
+                l->period_late = 1u;
+            }
+        }
+        if (chg_loss_tripped(l->loss_ms)) {
+            enter_stop(l);
+            if (l->port != CHG_PORT_SIF) {
+                begin_handshake(l);
+                mute_tx = 1u;
+            }
+        }
+    } else if (l->phase == CHG_PHASE_STOP && l->port != CHG_PORT_SIF) {
+        begin_handshake(l);
+    }
+    slow = due(&l->slow_ms, dt_ms, T_SLOW_MS, &l->slow_arm);
+    fast = due(&l->fast_ms, dt_ms, T_FAST_MS, &l->fast_arm);
+    advertised = l->cap;
+    advertised.ready = l->advertise_ready;
+
+    if (l->port == CHG_PORT_CAN && mute_tx == 0u) {
+        if (slow || l->cap_dirty) {
+            if (l->phase == CHG_PHASE_HS || l->cap_dirty) {
+                chg_can_cml(&advertised, &f);
+                push_can(tx, &f);
+            }
+            chg_can_cro(l->advertise_ready, &f);
+            push_can(tx, &f);
+            l->cap_dirty = 0u;
+        }
+        if (fast && l->phase == CHG_PHASE_RUN && !(meas->fault || meas->fault_code)) {
+            chg_can_ccs(meas, &f);
+            push_can(tx, &f);
+        }
+        if (meas->fault || meas->fault_code) {
+            chg_can_cst(&f);
+            push_can(tx, &f);
+        }
+    }
+    output_of(l, meas, tx, 1);
+}
+
+static void reply_485(ChrLink *l, uint8_t ready_now, const ChgStat *meas, ChrTx *tx)
+{
+    int n = 0;
+    ChgCap cap;
+    if (l->port != CHG_PORT_485) {
+        return;
+    }
+    if (l->phase == CHG_PHASE_HS || l->cap_dirty) {
+        cap = l->cap;
+        cap.ready = ready_now;
+        n = chg_cap_pack(&cap, tx->frame, sizeof tx->frame);
+        l->cap_dirty = 0u;
+    } else {
+        n = chg_stat_pack(meas, tx->frame, sizeof tx->frame);
+    }
+    if (n > 0) {
+        tx->frame_len = (uint8_t)n;
+    }
+}
+
+static void take_ctrl_frame(ChrLink *l, const uint8_t *frame, uint8_t n, const ChgStat *meas, ChrTx *tx)
+{
+    uint8_t msg = 0;
+    uint8_t data[28];
+    uint8_t len = 0;
+    ChgCtrl c;
+    if (frame_unpack(frame, n, &msg, data, &len) <= 0) {
+        return;
+    }
+    if (msg == 0x04u && len == 28u) {
+        /* 电池信息只保存，不刷新 T_loss，也不改当前输出。 */
+        remember_bat(l, data);
+        output_of(l, meas, tx, 0);
+        return;
+    }
+    if (msg != 0x01u || len != 6u) {
+        return;
+    }
+    if (load_ctrl(data, &c) != 0) {
+        return;
+    }
+    {
+        uint8_t ready_now = l->advertise_ready;
+        note_ctrl(l, &c, 0);
+        reply_485(l, ready_now, meas, tx);
+    }
+    output_of(l, meas, tx, 0);
+}
+
+void chr_link_rx_byte(ChrLink *l, uint8_t b, uint32_t gap_ms, const ChgStat *meas, ChrTx *tx)
+{
+    uint16_t total;
+    ChgStat none;
+
+    if (tx == 0) {
+        return;
+    }
+    memset(tx, 0, sizeof *tx);
+    if (l == 0 || (l->port != CHG_PORT_SIF && l->port != CHG_PORT_485)) {
+        return;
+    }
+    memset(&none, 0, sizeof none);
+    if (meas == 0) {
+        meas = &none;
+    }
+    if (l->line_fault || l->aux_fault) {
+        output_of(l, meas, tx, 0);
+        return;
+    }
+    output_of(l, meas, tx, 0);
+    /* OFF：上拉尚未打开。BMS 上电前仪表发来的字节整段丢掉，不计入握手。
+     * 第一次 tick 进入 HS 之后才解析 0x01。 */
+    if (l->port == CHG_PORT_SIF && l->phase == CHG_PHASE_OFF) {
+        l->raw_n = 0;
+        return;
+    }
+    if (gap_ms > T_GAP_MS && l->raw_n > 0u) {
+        l->raw_n = 0;
+    }
+    if (l->raw_n >= sizeof l->raw) {
+        l->raw_n = 0;
+    }
+    l->raw[l->raw_n++] = b;
+    if (l->raw_n < 5u) {
+        return;
+    }
+    if (l->raw[4] > 28u) {
+        l->raw_n = 0;
+        return;
+    }
+    total = (uint16_t)l->raw[4] + 7u;
+    if (total > sizeof l->raw) {
+        l->raw_n = 0;
+        return;
+    }
+    if (l->raw_n < total) {
+        return;
+    }
+    take_ctrl_frame(l, l->raw, (uint8_t)total, meas, tx);
+    l->raw_n = 0;
+}
+
+void chr_link_can_rx(ChrLink *l, const ChgCan *f, const ChgStat *meas, ChrTx *tx)
+{
+    ChgStat none;
+    int bcl_only = 0;
+
+    if (tx == 0) {
+        return;
+    }
+    memset(tx, 0, sizeof *tx);
+    if (l == 0 || f == 0 || l->port != CHG_PORT_CAN) {
+        return;
+    }
+    memset(&none, 0, sizeof none);
+    if (meas == 0) {
+        meas = &none;
+    }
+    if (l->line_fault || l->aux_fault) {
+        output_of(l, meas, tx, 0);
+        return;
+    }
+    if (f->id == CHG_CAN_BAT && f->dlc >= 8u) {
+        uint8_t seq = f->data[0];
+        if (seq > 3u) {
+            l->rx_drop++;
+        } else {
+            if (seq == 0u) {
+                memset(l->bat_part, 0, sizeof l->bat_part);
+                l->bat_mask = 0u;
+            }
+            memcpy(l->bat_part + (size_t)seq * 7u, f->data + 1, 7);
+            l->bat_mask = (uint8_t)(l->bat_mask | (uint8_t)(1u << seq));
+            if (l->bat_mask == 0x0Fu) {
+                remember_bat(l, l->bat_part);
+                l->bat_mask = 0u;
+            }
+        }
+        output_of(l, meas, tx, 0);
+        return;
+    }
+    if (f->id == CHG_CAN_BCL && f->dlc >= 5u && chg_id_accept(f->id, CHG_CAN_BCL)) {
+        /* 字节 4 只认 0x01 恒压、0x02 恒流。其他值不刷新 T_loss，也不改已保存的请求。 */
+        if (f->data[4] != 0x01u && f->data[4] != 0x02u) {
+            l->rx_drop++;
+            output_of(l, meas, tx, 0);
+            return;
+        }
+        if (l->bcl_seen) {
+            l->period_late = (uint8_t)!chg_period_ok(50u, l->bcl_gap_ms);
+        } else {
+            l->period_late = 0u;
+        }
+        l->bcl_seen = 1u;
+        l->bcl_gap_ms = 0u;
+        l->ctrl.v_req_01v = get_u16(f->data);
+        l->ctrl.i_req_01a = can_i_phys(get_u16(f->data + 2));
+        l->ctrl.cv = (uint8_t)(f->data[4] == 0x01u);
+        l->have_ctrl = 1u;
+        l->loss_ms = 0;
+        l->link_ok = 1u;
+        bcl_only = 1;
+    } else if (f->id == CHG_CAN_BRO && f->dlc >= 1u) {
+        /* 只认 0x00 和 0xAA。其他值不改变允许位，也不把充电机置为就绪。 */
+        if (f->data[0] != 0x00u && f->data[0] != 0xAAu) {
+            l->rx_drop++;
+            output_of(l, meas, tx, 0);
+            return;
+        }
+        l->ctrl.allow = (uint8_t)(f->data[0] == 0xAAu);
+        l->have_ctrl = 1u;
+        /* 就绪帧不携带电流。能量传输的 T_loss 只由 BCL 刷新。 */
+        l->link_ok = 1u;
+        if (l->ctrl.allow == 0u && (l->phase == CHG_PHASE_HS || l->phase == CHG_PHASE_STOP ||
+                                    l->phase == CHG_PHASE_OFF)) {
+            if (l->phase != CHG_PHASE_HS) {
+                begin_handshake(l);
+            }
+            l->seen_allow0 = 1u;
+            l->advertise_ready = 1u;
+            l->cap_dirty = 1u;
+            l->have_ctrl = 1u;
+            l->link_ok = 1u;
+        }
+    } else if (f->id == CHG_CAN_BSM && f->dlc >= 7u) {
+        {
+            uint8_t was_pause = l->ctrl.pause;
+            /* 只看 bit4。bit4 = 0 为暂停。bit5–bit7 保留，不参与。 */
+            l->ctrl.pause = (uint8_t)((f->data[6] & 0x10u) == 0u);
+            if (was_pause && l->ctrl.pause == 0u && l->phase == CHG_PHASE_RUN) {
+                l->resume_arm = 1u;
+            }
+        }
+        l->have_ctrl = 1u;
+        /* 状态帧可以改暂停位，不携带本拍电流，不刷新 T_loss。 */
+        l->link_ok = 1u;
+    } else if (f->id == CHG_CAN_BST && f->dlc >= 4u) {
+        l->ctrl.stop = 1u;
+        l->ctrl.i_req_01a = 0;
+        l->have_ctrl = 1u;
+        enter_stop(l);
+    } else {
+        l->rx_drop++;
+        output_of(l, meas, tx, 0);
+        return;
+    }
+    if (!bcl_only && l->ctrl.stop) {
+        enter_stop(l);
+    }
+    if (l->phase == CHG_PHASE_HS && l->seen_allow0 && l->ctrl.allow && l->advertise_ready) {
+        l->phase = CHG_PHASE_RUN;
+    }
+    output_of(l, meas, tx, 0);
+}
