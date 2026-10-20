@@ -821,9 +821,21 @@ static void test_apply(void)
     chg_apply(&c, &cap, 1, 1, 0, 0, &act);
     expect_eq("clamp i", act.i_out_01a, 800);
     c.i_req_01a = 400;
+    c.v_req_01v = 820;
+    chg_apply(&c, &cap, 1, 1, 0, 0, &act);
+    expect_eq("below lock on", act.enable, 1);
+    expect_eq("below lock volts", act.v_target_01v, 820);
+    c.v_req_01v = 1005;
+    chg_apply(&c, &cap, 1, 1, 0, 0, &act);
+    expect_eq("half volt on", act.enable, 1);
+    expect_eq("half volt clamps", act.v_target_01v, 1000);
+    c.v_req_01v = 1006;
+    chg_apply(&c, &cap, 1, 1, 0, 0, &act);
+    expect_eq("over lock off", act.enable, 0);
+    expect_eq("over lock volts", act.v_target_01v, 0);
     c.v_req_01v = 1200;
     chg_apply(&c, &cap, 1, 1, 0, 0, &act);
-    expect_eq("clamp v", act.v_target_01v, 1000);
+    expect_eq("far over lock off", act.enable, 0);
     c.v_req_01v = 840;
 
     c.pause = 1;
@@ -1450,6 +1462,21 @@ static void pack_01(uint8_t flags, uint8_t reserved, uint8_t out[13])
     out[12] = (uint8_t)(crc >> 8);
 }
 
+static void pack_01_vi(uint8_t flags, uint16_t v_01v, uint16_t i_01a, uint8_t out[13])
+{
+    uint16_t crc;
+    out[0] = 0xA5; out[1] = 0x5A; out[2] = 0x01; out[3] = 0x01; out[4] = 0x06;
+    out[5] = flags;
+    out[6] = (uint8_t)(v_01v & 0xFFu);
+    out[7] = (uint8_t)(v_01v >> 8);
+    out[8] = (uint8_t)(i_01a & 0xFFu);
+    out[9] = (uint8_t)(i_01a >> 8);
+    out[10] = 0;
+    crc = crc16_test(out, 11);
+    out[11] = (uint8_t)(crc & 0xFFu);
+    out[12] = (uint8_t)(crc >> 8);
+}
+
 /* BCL 模式只认 0x01/0x02。BRO 只认 0x00/0xAA。0x01 保留位非 0 整帧无效。 */
 static void test_defined_values(void)
 {
@@ -1503,6 +1530,25 @@ static void test_defined_values(void)
     expect_eq("bcl mode gap", link.bcl_gap_ms, 40u);
     expect_eq("bcl mode drop", link.rx_drop, drops + 1u);
 
+    drops = link.rx_drop;
+    loss = link.loss_ms;
+    link.bcl_gap_ms = 40u;
+    memcpy(f.data, "\xB0\x04\x30\x11\x02", 5); /* 120.0 V，锁压 100.0 V */
+    chr_link_can_rx(&link, &f, &st, &tx);
+    expect_eq("bcl over lock volts", tx.act.v_target_01v, 840);
+    expect_eq("bcl over lock saved", link.ctrl.v_req_01v, 840);
+    expect_eq("bcl over lock drop", link.rx_drop, drops + 1u);
+    expect_eq("bcl over lock loss", link.loss_ms, loss);
+    expect_eq("bcl over lock gap", link.bcl_gap_ms, 40u);
+    memcpy(f.data, "\x34\x03\x30\x11\x02", 5); /* 82.0 V */
+    chr_link_can_rx(&link, &f, &st, &tx);
+    expect_eq("bcl below lock", tx.act.v_target_01v, 820);
+    expect_eq("bcl below lock saved", link.ctrl.v_req_01v, 820);
+    memcpy(f.data, "\xED\x03\x30\x11\x02", 5); /* 100.5 V，锁压 +0.5 V */
+    chr_link_can_rx(&link, &f, &st, &tx);
+    expect_eq("bcl half volt", tx.act.v_target_01v, 1000);
+    expect_eq("bcl half volt saved", link.ctrl.v_req_01v, 1005);
+
     f.id = CHG_CAN_BRO;
     f.dlc = 1;
     f.data[0] = 0x11;
@@ -1522,6 +1568,24 @@ static void test_defined_values(void)
     pack_01(0x01, 0x00, frame);
     feed(&link, &st, frame, sizeof frame, &tx);
     expect_eq("sif legal counts", link.sif_got, 1);
+
+    reach_485(&link, &tx, &st);
+    expect_eq("485 lock base", tx.act.v_target_01v, 840);
+    drops = link.rx_drop;
+    loss = link.loss_ms;
+    pack_01_vi(0x01, 1200, 400, frame);
+    feed(&link, &st, frame, sizeof frame, &tx);
+    expect_eq("485 over lock volts", tx.act.v_target_01v, 840);
+    expect_eq("485 over lock saved", link.ctrl.v_req_01v, 840);
+    expect_eq("485 over lock drop", link.rx_drop, drops + 1u);
+    expect_eq("485 over lock loss", link.loss_ms, loss);
+    expect_eq("485 over lock silent", tx.frame_len, 0);
+    pack_01_vi(0x01, 820, 400, frame);
+    feed(&link, &st, frame, sizeof frame, &tx);
+    expect_eq("485 below lock", tx.act.v_target_01v, 820);
+    pack_01_vi(0x01, 1005, 400, frame);
+    feed(&link, &st, frame, sizeof frame, &tx);
+    expect_eq("485 half volt", tx.act.v_target_01v, 1000);
 
     chr_link_init(&link, CHG_PORT_SIF, &cap);
     chr_link_tick(&link, &st, 0, &tx);
