@@ -258,6 +258,12 @@ void chg_can_cst(ChgCan *f)
     f->data[0] = 0x01;
 }
 
+/* 锁压以上 0.5 V 仍执行，电压目标停在锁压。再高的请求不执行。单位 0.1 V。 */
+static int v_req_above_lock(uint16_t v_req_01v, uint16_t v_lock_01v)
+{
+    return (uint32_t)v_req_01v > (uint32_t)v_lock_01v + 5u;
+}
+
 void chg_apply(const ChgCtrl *ctrl, const ChgCap *cap, uint8_t cap_valid, uint8_t link_ok,
                uint8_t paths_conflict, uint8_t charger_fault, ChgAct *act)
 {
@@ -282,6 +288,10 @@ void chg_apply(const ChgCtrl *ctrl, const ChgCap *cap, uint8_t cap_valid, uint8_
     v = ctrl->v_req_01v;
     if (i > cap->i_max_01a) {
         i = cap->i_max_01a;
+    }
+    /* 低于锁压按请求执行，不得抬回锁压。高出 0.5 V 的请求本周期不出流。 */
+    if (v_req_above_lock(v, cap->v_max_01v)) {
+        return;
     }
     if (v > cap->v_max_01v) {
         v = cap->v_max_01v;
@@ -663,6 +673,12 @@ static void take_ctrl_frame(ChrLink *l, const uint8_t *frame, uint8_t n, const C
     if (load_ctrl(data, &c) != 0) {
         return;
     }
+    /* 高于锁压 0.5 V：整帧无效。不刷新 T_loss，不改已保存的请求，也不改锁压。 */
+    if (v_req_above_lock(c.v_req_01v, l->cap.v_max_01v)) {
+        l->rx_drop++;
+        output_of(l, meas, tx, 0);
+        return;
+    }
     {
         uint8_t ready_now = l->advertise_ready;
         note_ctrl(l, &c, 0);
@@ -766,6 +782,11 @@ void chr_link_can_rx(ChrLink *l, const ChgCan *f, const ChgStat *meas, ChrTx *tx
     if (f->id == CHG_CAN_BCL && f->dlc >= 5u && chg_id_accept(f->id, CHG_CAN_BCL)) {
         /* 字节 4 只认 0x01 恒压、0x02 恒流。其他值不刷新 T_loss，也不改已保存的请求。 */
         if (f->data[4] != 0x01u && f->data[4] != 0x02u) {
+            l->rx_drop++;
+            output_of(l, meas, tx, 0);
+            return;
+        }
+        if (v_req_above_lock(get_u16(f->data), l->cap.v_max_01v)) {
             l->rx_drop++;
             output_of(l, meas, tx, 0);
             return;
