@@ -725,36 +725,38 @@ static void test_bms_null_guards(void)
     }
 }
 
-/* 防御性测试：raw 缓冲越界 + 声明 LEN>9 的恶意帧。
- * raw[40] = sizeof 缓冲；声明 LEN 字段时 > 9 直接丢弃（防止溢出 + 解析错位）。
- * 注：line 638 的 `raw_n >= sizeof raw` 与 line 649 的 `total > sizeof l->raw`
- * 在 raw[4]<=9 时不可达（total=7+9=16<40）— 这两条是防御性分支，留作未来收紧。 */
+/* 防御性测试：raw 缓冲越界，以及长度大于 0x02/0x03 的帧。
+ * raw[40]。声明长度加上 7 超过缓冲时，在第 5 字节丢掉。
+ * 长度在 10 到 33 之间时先收满整帧，再整帧丢掉，不写进 9 字节 data。 */
 static void test_raw_guards(void)
 {
     BmsLink link;
     BmsTx tx;
     ChgCtrl c = energy();
-    uint8_t huge_len[12] = {
-        0xA5, 0x5A, 0x01, 0x01,
-        0x0A, /* LEN = 10 (declared > 9 → should be dropped immediately) */
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    };
+    uint8_t len10[17];
     uint8_t i;
 
-    /* raw[4] > 9：声明 LEN=10 的帧直接被丢弃，frame_len 不变，raw_n 清零。 */
+    /* LEN=10 收满 17 字节后整帧丢掉。相位保持握手，raw_n 清零。 */
+    memset(len10, 0, sizeof len10);
+    len10[0] = 0xA5;
+    len10[1] = 0x5A;
+    len10[2] = 0x01;
+    len10[3] = 0x07;
+    len10[4] = 10;
     bms_link_init(&link, CHG_PORT_485);
     bms_link_tick(&link, &c, 0, &tx);
-    feed(&link, &c, huge_len, sizeof huge_len, &tx);
+    feed(&link, &c, len10, sizeof len10, &tx);
     expect_eq("raw len10 dropped", tx.frame_len, 0);
     expect_eq("raw len10 reset", link.raw_n, 0);
+    expect_eq("raw len10 phase", link.phase, CHG_PHASE_HS);
+    expect_eq("raw len10 seen", link.seen_ready, 0);
 
-    /* raw[4] > 9u 触发后，喂第 5 字节 LEN>9 → 再次丢弃；累加器重置。 */
+    /* 声明长度超过缓冲（0xCC + 7 > 40）时，第 5 字节复位。 */
     bms_link_init(&link, CHG_PORT_485);
     bms_link_tick(&link, &c, 0, &tx);
     for (i = 0; i < 5; i++) {
         bms_link_rx_byte(&link, 0xCC, 10, &c, &tx);
     }
-    /* raw_n=5, raw[4]=0xCC>9 → 走 line 645 reset，raw_n=0 */
     expect_eq("raw len15 reset", link.raw_n, 0);
 
     /* raw[4] == 9 边界：cap0 是 LEN=9 → 应被尝试解析（CRC 不过不报错）。 */
@@ -1251,6 +1253,41 @@ static void test_defined_values(void)
     }
 }
 
+/* 合法 CRC 的 0x07 不改变握手。下一帧 0x02 仍被接受。 */
+static void test_skip_auth(void)
+{
+    BmsLink link;
+    BmsTx tx;
+    ChgCtrl c = energy();
+    uint8_t tok[20];
+    uint16_t crc;
+    uint8_t phase;
+    uint8_t seen;
+    static const uint8_t cap1[] = {0xA5, 0x5A, 0x01, 0x02, 0x09, 0x01, 0xF4, 0x01, 0xE8, 0x03,
+                                   0x0A, 0x00, 0x20, 0x03, 0xEA, 0x7C};
+
+    memset(tok, 0, sizeof tok);
+    tok[0] = 0xA5;
+    tok[1] = 0x5A;
+    tok[2] = 0x01;
+    tok[3] = 0x07;
+    tok[4] = 13;
+    crc = crc16_test(tok, 18);
+    tok[18] = (uint8_t)(crc & 0xFFu);
+    tok[19] = (uint8_t)(crc >> 8);
+
+    bms_link_init(&link, CHG_PORT_485);
+    bms_link_tick(&link, &c, 0, &tx);
+    phase = link.phase;
+    seen = link.seen_ready;
+    feed(&link, &c, tok, sizeof tok, &tx);
+    expect_eq("auth skip phase", link.phase, phase);
+    expect_eq("auth skip seen", link.seen_ready, seen);
+    expect_eq("auth skip raw", link.raw_n, 0);
+    feed(&link, &c, cap1, sizeof cap1, &tx);
+    expect_eq("auth then cap", link.phase, CHG_PHASE_RUN);
+}
+
 int main(void)
 {
     test_sif();
@@ -1271,6 +1308,7 @@ int main(void)
     test_period_and_address();
     test_ccs_fault_byte();
     test_defined_values();
+    test_skip_auth();
     test_bsm_flags();
     test_bms_null_guards();
     test_raw_guards();

@@ -4,6 +4,7 @@
  * 无堆。ChgCrypt 与 ChgMacWork 由调用方提供，可放在静态存储。
  * 同一块 ChgMacWork 同时只做一次运算。
  * 不调用本模块时，0x01–0x04 的会话与原来相同。
+ * 哈希不编进会话壳。映像里有算法时，用 chg_crypt_set_mac 装上。
  */
 #ifndef CHG_CRYPT_H
 #define CHG_CRYPT_H
@@ -24,6 +25,24 @@
 #define CHG_SUITE_PLAIN 0x00u
 #define CHG_SUITE_HMAC  0x01u
 #define CHG_SUITE_NONE  0xFFu
+
+/* 0 档只宣布明文。1 档宣布 0x01，并允许对端退回明文。 */
+#define CHG_CRYPT_LEVEL_PLAIN 0u
+#define CHG_CRYPT_LEVEL_HMAC  1u
+
+/* 两块状态的上限。8051 的外部 RAM 至少要有这么多空闲。 */
+#define CHG_CRYPT_STATE_MAX 1024u
+/* 32 位档：剩余程序、剩余 RAM。栈预算已算在 RAM 里。 */
+#define CHG_CRYPT_CODE_32 8192u
+#define CHG_CRYPT_RAM_32 2048u
+#define CHG_CRYPT_STACK_BUDGET 544u
+/* 8051 档：剩余程序。外部 RAM 的下限就是 CHG_CRYPT_STATE_MAX。 */
+#define CHG_CRYPT_CODE_51 24576u
+
+/* 置 1 时本映像不调用 HMAC，也不能把 0x01 当成可执行套件。默认映像保持 0。 */
+#ifndef CHG_CRYPT_OMIT_HMAC
+#define CHG_CRYPT_OMIT_HMAC 0
+#endif
 
 #define CHG_CRYPT_F_PLAIN 0x01u /* 无共同套件时允许明文 */
 #define CHG_CRYPT_F_BIDI  0x02u /* 要求充电机也出盐。一线通完不成 */
@@ -59,19 +78,26 @@
 
 typedef struct {
     uint32_t s[8];
-    uint64_t bits;
+    uint32_t bits_hi; /* 已处理比特数的高 32 位。C51 没有 64 位整数 */
+    uint32_t bits_lo;
     uint8_t buf[64];
     uint8_t n;
 } ChgSha256;
 
-/* 调用方持有的工作区。SHA-256 的块状态、HMAC 的垫块和报文暂存都在这里。 */
+/* 调用方持有的工作区。去掉 HMAC 的映像没有哈希状态。
+ * 默认映像里，调度字和 64 字节暂存各一份。派生报文、57 字节覆盖和内层摘要
+ * 共用这块暂存。长期密钥和会话密钥不要指向它。 */
+#if CHG_CRYPT_OMIT_HMAC
+typedef struct {
+    uint8_t unused;
+} ChgMacWork;
+#else
 typedef struct {
     ChgSha256 sha;
-    uint8_t pad[64];
     uint32_t w[16];
-    uint8_t dig[32];
-    uint8_t msg[64];
+    uint8_t blk[64];
 } ChgMacWork;
+#endif
 
 /* 钩子把厂商正文还原成标准 0x01（6 字节）或 0x04（28 字节）。失败返回非 0。 */
 typedef int (*ChgCryptVendorFn)(uint8_t suite,
@@ -81,8 +107,10 @@ typedef int (*ChgCryptVendorFn)(uint8_t suite,
 
 typedef struct {
     const uint8_t *allow;
+#if !CHG_CRYPT_OMIT_HMAC
     ChgCryptVendorFn vendor;
     void *vendor_user;
+#endif
     uint32_t rx_counter;
     uint32_t tx_counter;
     uint32_t lock_ms;
@@ -125,6 +153,22 @@ typedef struct {
 void chg_sha256(ChgMacWork *w, const uint8_t *msg, size_t n, uint8_t out[32]);
 void chg_hmac_sha256(ChgMacWork *w, const uint8_t *key, size_t key_len,
                      const uint8_t *msg, size_t msg_len, uint8_t out[32]);
+
+/* 套件 0x01 的 MAC。参数非法返回 0，成功返回 1，并写出 32 字节摘要。
+ * 会话壳只经这只指针调用。CHG_CRYPT_OMIT_HMAC=1 时 chg_crypt_set_mac 为空操作。 */
+typedef int (*ChgCryptMacFn)(ChgMacWork *w, const uint8_t *key, size_t key_len,
+                             const uint8_t *msg, size_t msg_len, uint8_t out[32]);
+void chg_crypt_set_mac(ChgCryptMacFn fn);
+
+/* 把本文件里的 HMAC-SHA256 装进会话。实现在 chg_sha256.c。
+ * 去掉 HMAC 的映像不链接该文件，也不要调用本函数。 */
+void chg_crypt_install_hmac(void);
+
+/* 按算力档填写 hello 的套件表。成功返回写入的个数，参数无效返回 0。
+ * 0 档、去掉 HMAC 的映像、以及 MAC 尚未安装：只写 0x00。
+ * 1 档且 MAC 已安装：只写 0x01。
+ * flags 写出明文许可，调用方可再或上双向盐。未知档按 0 档。 */
+uint8_t chg_crypt_level_suites(uint8_t level, uint8_t *suites, uint8_t cap, uint8_t *flags);
 
 /* key 为 16 字节长期密钥，只用来派生会话密钥。suites 最多 4 个。flags 只用 bit0 与 bit1。 */
 void chg_crypt_init(ChgCrypt *c, uint8_t role, uint8_t port,
@@ -173,5 +217,17 @@ int chg_crypt_output_allowed(const ChgCrypt *c);
 /* BMS：1 表示本拍可以把允许位置 1。 */
 int chg_crypt_bms_may_allow(const ChgCrypt *c);
 void chg_crypt_bind_output(const ChgCrypt *c, uint16_t *i_out_01a, uint8_t *enable);
+
+/* 从已经组好的明文帧取出覆盖内容。只接受 CRC 正确的 0x01（6 字节）和 0x04（28 字节）。
+ * 写入成功返回 1。其它帧、CRC 不对或长度不够时返回 0，并且不改会话。
+ * 认证帧仍只走 chg_crypt_rx_frame。先调用本函数，再核对 0x07。 */
+int chg_crypt_observe(ChgCrypt *c, const uint8_t *frame, size_t n);
+
+/* 在组 0x01 之前调用。就地修改 ctrl 的 6 字节。
+ * BMS 且本拍不能置允许位时，清掉 ctrl[0] 的 bit0。然后记入本拍覆盖。
+ * bat 为 0 表示尚无 0x04。套件为 0x01 时把 0x07 写入 auth，返回帧长。
+ * 明文套件返回 0，不另组帧。参数无效或令牌组不出来返回 -1。 */
+int chg_crypt_cover_ctrl(ChgCrypt *c, ChgMacWork *w, uint8_t ctrl[CHG_CRYPT_CTRL],
+                         const uint8_t *bat, uint8_t *auth, size_t auth_cap);
 
 #endif

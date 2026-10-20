@@ -821,16 +821,18 @@ void bms_link_rx_byte(BmsLink *l, uint8_t b, uint32_t gap_ms, const ChgCtrl *ctr
     if (l->raw_n < 5u) {
         return;
     }
-    if (l->raw[4] > 9u) {
+    /* 放得进 raw 的长帧先收满再整帧丢掉。0x05–0x08 与 0x02/0x03 同线时不会错同步。
+     * data 只有 9 字节，长度大于 9 的帧不得解进这块缓冲。 */
+    if ((size_t)l->raw[4] + 7u > sizeof l->raw) {
         l->raw_n = 0;
         return;
     }
     total = (uint16_t)l->raw[4] + 7u;
-    if (total > sizeof l->raw) {
-        l->raw_n = 0;
+    if (l->raw_n < total) {
         return;
     }
-    if (l->raw_n < total) {
+    if (l->raw[4] > 9u) {
+        l->raw_n = 0;
         return;
     }
     if (frame_unpack(l->raw, total, &msg, data, &len) > 0) {

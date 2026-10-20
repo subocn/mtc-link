@@ -10,7 +10,14 @@ static uint32_t rotr(uint32_t x, uint32_t n)
     return (x >> n) | (x << (32u - n));
 }
 
-static const uint32_t K[64] = {
+/* Keil C51 若不写 code，这 256 字节会进外部 RAM。 */
+#if defined(__C51__)
+#define CHG_ROM code
+#else
+#define CHG_ROM
+#endif
+
+static const uint32_t CHG_ROM K[64] = {
     0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u,
     0x923f82a4u, 0xab1c5ed5u, 0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
     0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u, 0xe49b69c1u, 0xefbe4786u,
@@ -34,19 +41,31 @@ static void sha_init(ChgSha256 *c)
     c->s[5] = 0x9b05688cu;
     c->s[6] = 0x1f83d9abu;
     c->s[7] = 0x5be0cd19u;
-    c->bits = 0;
+    c->bits_hi = 0;
+    c->bits_lo = 0;
     c->n = 0;
 }
 
-static void sha_block(ChgSha256 *c, const uint8_t *blk, uint32_t *w)
+/* 比特数 += n*8。单次加数不超过 32 位，进位写到 bits_hi。 */
+static void bits_add(ChgSha256 *c, size_t n)
+{
+    while (n > 0u) {
+        uint32_t chunk = (n > 0x1FFFFFFFu) ? 0x1FFFFFFFu : (uint32_t)n;
+        uint32_t add = chunk << 3;
+        uint32_t lo = c->bits_lo + add;
+        if (lo < c->bits_lo) {
+            c->bits_hi++;
+        }
+        c->bits_lo = lo;
+        n -= chunk;
+    }
+}
+
+static void sha_compress(ChgSha256 *c, uint32_t *w)
 {
     uint32_t a, b, d, e, f, g, h, cc;
     uint32_t i;
 
-    for (i = 0; i < 16u; i++) {
-        w[i] = ((uint32_t)blk[i * 4u] << 24) | ((uint32_t)blk[i * 4u + 1u] << 16) |
-               ((uint32_t)blk[i * 4u + 2u] << 8) | (uint32_t)blk[i * 4u + 3u];
-    }
     a = c->s[0];
     b = c->s[1];
     cc = c->s[2];
@@ -56,21 +75,20 @@ static void sha_block(ChgSha256 *c, const uint8_t *blk, uint32_t *w)
     g = c->s[6];
     h = c->s[7];
     for (i = 0; i < 64u; i++) {
-        uint32_t wi, s0, s1, ch, maj, t1, t2;
+        uint32_t s0, s1, t1;
+        uint32_t wi = w[i & 15u];
         if (i >= 16u) {
             uint32_t x15 = w[(i - 15u) & 15u];
             uint32_t x2 = w[(i - 2u) & 15u];
             s0 = rotr(x15, 7) ^ rotr(x15, 18) ^ (x15 >> 3);
             s1 = rotr(x2, 17) ^ rotr(x2, 19) ^ (x2 >> 10);
-            w[i & 15u] = w[i & 15u] + s0 + w[(i - 7u) & 15u] + s1;
+            wi = w[i & 15u] + s0 + w[(i - 7u) & 15u] + s1;
+            w[i & 15u] = wi;
         }
-        wi = w[i & 15u];
         s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-        ch = (e & f) ^ ((~e) & g);
-        t1 = h + s1 + ch + K[i] + wi;
-        s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-        maj = (a & b) ^ (a & cc) ^ (b & cc);
-        t2 = s0 + maj;
+        t1 = h + s1 + ((e & f) ^ ((~e) & g)) + K[i] + wi;
+        s0 = t1 + (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) +
+             ((a & b) ^ (a & cc) ^ (b & cc));
         h = g;
         g = f;
         f = e;
@@ -78,7 +96,7 @@ static void sha_block(ChgSha256 *c, const uint8_t *blk, uint32_t *w)
         d = cc;
         cc = b;
         b = a;
-        a = t1 + t2;
+        a = s0;
     }
     c->s[0] += a;
     c->s[1] += b;
@@ -90,12 +108,58 @@ static void sha_block(ChgSha256 *c, const uint8_t *blk, uint32_t *w)
     c->s[7] += h;
 }
 
+static void sha_block(ChgSha256 *c, const uint8_t *blk, uint32_t *w)
+{
+    uint32_t i;
+
+    for (i = 0; i < 16u; i++) {
+        w[i] = ((uint32_t)blk[i * 4u] << 24) | ((uint32_t)blk[i * 4u + 1u] << 16) |
+               ((uint32_t)blk[i * 4u + 2u] << 8) | (uint32_t)blk[i * 4u + 3u];
+    }
+    sha_compress(c, w);
+}
+
+/* 密钥块不另占 64 字节。直接按 (key 字节异或 mask) 装进调度字。 */
+static void sha_absorb_pad(ChgSha256 *c, uint32_t *w, const uint8_t *key, size_t key_len,
+                           uint8_t mask)
+{
+    uint8_t i;
+
+    for (i = 0; i < 16u; i++) {
+        uint32_t word = 0;
+        uint8_t b;
+        for (b = 0; b < 4u; b++) {
+            size_t idx = (size_t)i * 4u + b;
+            uint8_t v = 0;
+            if (idx < key_len) {
+                v = key[idx];
+            }
+            word = (word << 8) | (uint32_t)(uint8_t)(v ^ mask);
+        }
+        w[i] = word;
+    }
+    bits_add(c, 64u);
+    sha_compress(c, w);
+}
+
 static void sha_update(ChgSha256 *c, const uint8_t *p, size_t n, uint32_t *w)
 {
-    size_t i;
-    c->bits += (uint64_t)n * 8u;
-    for (i = 0; i < n; i++) {
-        c->buf[c->n++] = p[i];
+    bits_add(c, n);
+    while (n > 0u) {
+        size_t space;
+        size_t take;
+        if (c->n == 0u && n >= 64u) {
+            sha_block(c, p, w);
+            p += 64u;
+            n -= 64u;
+            continue;
+        }
+        space = (size_t)(64u - c->n);
+        take = n < space ? n : space;
+        memcpy(c->buf + c->n, p, take);
+        c->n = (uint8_t)(c->n + (uint8_t)take);
+        p += take;
+        n -= take;
         if (c->n == 64u) {
             sha_block(c, c->buf, w);
             c->n = 0;
@@ -118,9 +182,14 @@ static void sha_final(ChgSha256 *c, uint8_t out[32], uint32_t *w)
     while (n < 56u) {
         c->buf[n++] = 0;
     }
-    for (i = 0; i < 8u; i++) {
-        c->buf[63u - i] = (uint8_t)(c->bits >> (8u * i));
-    }
+    c->buf[56] = (uint8_t)(c->bits_hi >> 24);
+    c->buf[57] = (uint8_t)(c->bits_hi >> 16);
+    c->buf[58] = (uint8_t)(c->bits_hi >> 8);
+    c->buf[59] = (uint8_t)c->bits_hi;
+    c->buf[60] = (uint8_t)(c->bits_lo >> 24);
+    c->buf[61] = (uint8_t)(c->bits_lo >> 16);
+    c->buf[62] = (uint8_t)(c->bits_lo >> 8);
+    c->buf[63] = (uint8_t)c->bits_lo;
     sha_block(c, c->buf, w);
     for (i = 0; i < 8u; i++) {
         out[i * 4u] = (uint8_t)(c->s[i] >> 24);
@@ -140,34 +209,48 @@ void chg_sha256(ChgMacWork *w, const uint8_t *msg, size_t n, uint8_t out[32])
     sha_final(&w->sha, out, w->w);
 }
 
+/* key_len 不超过 64。内层摘要写到 inner，密钥本身保持不动。 */
+static void hmac_blocks(ChgMacWork *w, const uint8_t *key, size_t key_len,
+                        const uint8_t *msg, size_t msg_len, uint8_t *inner, uint8_t out[32])
+{
+    sha_init(&w->sha);
+    sha_absorb_pad(&w->sha, w->w, key, key_len, 0x36u);
+    sha_update(&w->sha, msg, msg_len, w->w);
+    sha_final(&w->sha, inner, w->w);
+    sha_init(&w->sha);
+    sha_absorb_pad(&w->sha, w->w, key, key_len, 0x5cu);
+    sha_update(&w->sha, inner, 32u, w->w);
+    sha_final(&w->sha, out, w->w);
+}
+
 void chg_hmac_sha256(ChgMacWork *w, const uint8_t *key, size_t key_len,
                      const uint8_t *msg, size_t msg_len, uint8_t out[32])
 {
-    size_t i;
     if (w == 0 || out == 0 || (key_len > 0u && key == 0) || (msg_len > 0u && msg == 0)) {
         return;
     }
-    memset(w->pad, 0, sizeof w->pad);
     if (key_len > 64u) {
+        /* 长密钥先折叠进 blk。内层摘要改写到 out，避免盖住折叠后的密钥。 */
         sha_init(&w->sha);
         sha_update(&w->sha, key, key_len, w->w);
-        sha_final(&w->sha, w->dig, w->w);
-        memcpy(w->pad, w->dig, 32u);
-    } else if (key_len > 0u) {
-        memcpy(w->pad, key, key_len);
+        sha_final(&w->sha, w->blk, w->w);
+        hmac_blocks(w, w->blk, 32u, msg, msg_len, out, out);
+        return;
     }
-    for (i = 0; i < 64u; i++) {
-        w->pad[i] ^= 0x36u;
+    hmac_blocks(w, key, key_len, msg, msg_len, w->blk, out);
+}
+
+static int hmac_mac(ChgMacWork *w, const uint8_t *key, size_t key_len,
+                    const uint8_t *msg, size_t msg_len, uint8_t out[32])
+{
+    if (w == 0 || out == 0 || (key_len > 0u && key == 0) || (msg_len > 0u && msg == 0)) {
+        return 0;
     }
-    sha_init(&w->sha);
-    sha_update(&w->sha, w->pad, 64u, w->w);
-    sha_update(&w->sha, msg, msg_len, w->w);
-    sha_final(&w->sha, w->dig, w->w);
-    for (i = 0; i < 64u; i++) {
-        w->pad[i] ^= (uint8_t)(0x36u ^ 0x5cu);
-    }
-    sha_init(&w->sha);
-    sha_update(&w->sha, w->pad, 64u, w->w);
-    sha_update(&w->sha, w->dig, 32u, w->w);
-    sha_final(&w->sha, out, w->w);
+    chg_hmac_sha256(w, key, key_len, msg, msg_len, out);
+    return 1;
+}
+
+void chg_crypt_install_hmac(void)
+{
+    chg_crypt_set_mac(hmac_mac);
 }

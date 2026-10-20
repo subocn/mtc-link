@@ -29,6 +29,9 @@ static void expect_mem(const char *name, const uint8_t *got, const uint8_t *want
 
 typedef char chg_mac_work_small[(sizeof(ChgMacWork) <= 400) ? 1 : -1];
 typedef char chg_crypt_small[(sizeof(ChgCrypt) <= 256) ? 1 : -1];
+typedef char chg_state_1k[(sizeof(ChgCrypt) + sizeof(ChgMacWork) <= CHG_CRYPT_STATE_MAX) ? 1 : -1];
+typedef char chg_state_ram32[(sizeof(ChgCrypt) + sizeof(ChgMacWork) + CHG_CRYPT_STACK_BUDGET
+                             <= CHG_CRYPT_RAM_32) ? 1 : -1];
 
 static const uint8_t KEY[16] = {
     0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
@@ -57,14 +60,23 @@ static void test_sha(void)
         0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1, 0x2b,
         0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7
     };
+    static const uint8_t mac_long[32] = {
+        0x60, 0xe4, 0x31, 0x59, 0x1e, 0xe0, 0xb6, 0x7f, 0x0d, 0x8a, 0x26, 0xaa, 0xcb, 0xf5, 0xb7, 0x7f,
+        0x8e, 0x0b, 0xc6, 0x21, 0x37, 0x28, 0xc5, 0x14, 0x05, 0x46, 0x04, 0x0f, 0x0e, 0xe3, 0x7f, 0x54
+    };
+    static const char long_msg[] = "Test Using Larger Than Block-Size Key - Hash Key First";
     uint8_t k[20];
+    uint8_t klong[131];
     memset(k, 0x0b, sizeof k);
+    memset(klong, 0xaa, sizeof klong);
     chg_sha256(&w, (const uint8_t *)"abc", 3, out);
     expect_mem("sha256 abc", out, abc, 32);
     chg_sha256(&w, 0, 0, out);
     expect_mem("sha256 empty", out, empty, 32);
     chg_hmac_sha256(&w, k, sizeof k, (const uint8_t *)"Hi There", 8, out);
     expect_mem("hmac rfc4231", out, mac, 32);
+    chg_hmac_sha256(&w, klong, sizeof klong, (const uint8_t *)long_msg, sizeof long_msg - 1u, out);
+    expect_mem("hmac rfc4231 long key", out, mac_long, 32);
 }
 
 static void arm(ChgCrypt *bms, ChgCrypt *chr, uint8_t port, const uint8_t *suites, uint8_t ns,
@@ -667,8 +679,128 @@ static void test_salt_and_fresh(void)
     expect_eq("uni peer dropped", bms.peer_ok, 0);
 }
 
+static void init_level(ChgCrypt *c, uint8_t role, uint8_t port, const uint8_t *id, uint8_t level)
+{
+    uint8_t suites[4];
+    uint8_t flags = 0;
+    uint8_t n = chg_crypt_level_suites(level, suites, 4, &flags);
+    chg_crypt_init(c, role, port, KEY, id, suites, n, flags);
+    chg_crypt_set_salt_bms(c, SALT_BMS);
+    chg_crypt_set_salt_chr(c, SALT_CHR);
+}
+
+static void test_levels(void)
+{
+    ChgCrypt bms, chr;
+    ChgMacWork w;
+    uint8_t suites[4];
+    uint8_t flags = 0;
+    uint8_t only_hmac[1];
+    uint8_t f[48];
+    uint16_t i;
+    uint8_t en;
+    int n;
+
+    n = (int)chg_crypt_level_suites(CHG_CRYPT_LEVEL_PLAIN, suites, 4, &flags);
+    expect_eq("lv0 n", (unsigned)n, 1);
+    expect_eq("lv0 suite", suites[0], CHG_SUITE_PLAIN);
+    expect_eq("lv0 flags", flags, CHG_CRYPT_F_PLAIN);
+    n = (int)chg_crypt_level_suites(CHG_CRYPT_LEVEL_HMAC, suites, 4, &flags);
+    expect_eq("lv1 n", (unsigned)n, 1);
+    expect_eq("lv1 suite", suites[0], CHG_SUITE_HMAC);
+    expect_eq("lv1 flags", flags, CHG_CRYPT_F_PLAIN);
+    n = (int)chg_crypt_level_suites(9, suites, 4, &flags);
+    expect_eq("lv9 suite", suites[0], CHG_SUITE_PLAIN);
+    expect_eq("lv bad", (unsigned)chg_crypt_level_suites(CHG_CRYPT_LEVEL_HMAC, 0, 4, &flags), 0);
+    expect_eq("state max", CHG_CRYPT_STATE_MAX, 1024u);
+    expect_eq("code 32", CHG_CRYPT_CODE_32, 8192u);
+    expect_eq("code 51", CHG_CRYPT_CODE_51, 24576u);
+
+    init_level(&bms, CHG_CRYPT_ROLE_BMS, CHG_CRYPT_PORT_485, ID_BMS, CHG_CRYPT_LEVEL_PLAIN);
+    init_level(&chr, CHG_CRYPT_ROLE_CHR, CHG_CRYPT_PORT_485, ID_CHR, CHG_CRYPT_LEVEL_HMAC);
+    expect_eq("mix hello", (unsigned)hello_485(&bms, &chr, &w), 1);
+    expect_eq("mix suite", chr.suite, CHG_SUITE_PLAIN);
+    i = 300;
+    en = 1;
+    chg_crypt_bind_output(&chr, &i, &en);
+    expect_eq("mix amps", i, 300);
+    expect_eq("mix bms", (unsigned)chg_crypt_bms_may_allow(&bms), 1);
+
+    init_level(&bms, CHG_CRYPT_ROLE_BMS, CHG_CRYPT_PORT_485, ID_BMS, CHG_CRYPT_LEVEL_PLAIN);
+    init_level(&chr, CHG_CRYPT_ROLE_CHR, CHG_CRYPT_PORT_485, ID_CHR, CHG_CRYPT_LEVEL_HMAC);
+    chg_crypt_factory_activate(&bms, KEY, ID_CHR);
+    chg_crypt_factory_activate(&chr, KEY, ID_BMS);
+    chg_crypt_set_salt_bms(&bms, SALT_BMS);
+    chg_crypt_set_salt_chr(&chr, SALT_CHR);
+    expect_eq("bound plain hello", (unsigned)hello_485(&bms, &chr, &w), 1);
+    expect_eq("bound plain suite", bms.suite, CHG_SUITE_PLAIN);
+    i = 300;
+    en = 1;
+    chg_crypt_bind_output(&chr, &i, &en);
+    expect_eq("bound plain amps", i, 0);
+    expect_eq("bound plain en", en, 0);
+    expect_eq("bound plain bms", (unsigned)chg_crypt_bms_may_allow(&bms), 0);
+
+    init_level(&bms, CHG_CRYPT_ROLE_BMS, CHG_CRYPT_PORT_485, ID_BMS, CHG_CRYPT_LEVEL_HMAC);
+    init_level(&chr, CHG_CRYPT_ROLE_CHR, CHG_CRYPT_PORT_485, ID_CHR, CHG_CRYPT_LEVEL_HMAC);
+    expect_eq("both hello", (unsigned)hello_485(&bms, &chr, &w), 1);
+    expect_eq("both suite", chr.suite, CHG_SUITE_HMAC);
+    i = 300;
+    en = 1;
+    chg_crypt_bind_output(&chr, &i, &en);
+    expect_eq("both before", i, 0);
+    chg_crypt_set_ctrl(&bms, CTRL);
+    chg_crypt_set_ctrl(&chr, CTRL);
+    n = chg_crypt_pack_token(&bms, &w, f, sizeof f);
+    expect_eq("both token", n > 0, 1);
+    expect_eq("both rx", (unsigned)chg_crypt_rx_frame(&chr, &w, f, (size_t)n), 1);
+    i = 300;
+    en = 1;
+    chg_crypt_bind_output(&chr, &i, &en);
+    expect_eq("both amps", i, 300);
+    expect_eq("both bms", (unsigned)chg_crypt_bms_may_allow(&bms), 1);
+
+    only_hmac[0] = CHG_SUITE_HMAC;
+    chg_crypt_init(&bms, CHG_CRYPT_ROLE_BMS, CHG_CRYPT_PORT_485, KEY, ID_BMS, only_hmac, 1, 0);
+    chg_crypt_set_salt_bms(&bms, SALT_BMS);
+    init_level(&chr, CHG_CRYPT_ROLE_CHR, CHG_CRYPT_PORT_485, ID_CHR, CHG_CRYPT_LEVEL_PLAIN);
+    expect_eq("reject hello", (unsigned)hello_485(&bms, &chr, &w), 1);
+    expect_eq("reject suite", chr.suite, CHG_SUITE_NONE);
+    expect_eq("reject bms", bms.suite, CHG_SUITE_NONE);
+    i = 300;
+    en = 1;
+    chg_crypt_bind_output(&chr, &i, &en);
+    expect_eq("reject amps", i, 0);
+
+    init_level(&bms, CHG_CRYPT_ROLE_BMS, CHG_CRYPT_PORT_SIF, ID_BMS, CHG_CRYPT_LEVEL_HMAC);
+    init_level(&chr, CHG_CRYPT_ROLE_CHR, CHG_CRYPT_PORT_SIF, ID_CHR, CHG_CRYPT_LEVEL_HMAC);
+    chg_crypt_factory_activate(&bms, KEY, ID_CHR);
+    chg_crypt_factory_activate(&chr, KEY, ID_BMS);
+    chg_crypt_set_salt_bms(&bms, SALT_BMS);
+    n = chg_crypt_pack_hello_bms(&bms, f, sizeof f);
+    expect_eq("sif bound hello", n > 0, 1);
+    expect_eq("sif bound rx", (unsigned)chg_crypt_rx_frame(&chr, &w, f, (size_t)n), 1);
+    i = 300;
+    en = 1;
+    chg_crypt_bind_output(&chr, &i, &en);
+    expect_eq("sif bound amps", i, 0);
+    expect_eq("sif bound bms", (unsigned)chg_crypt_bms_may_allow(&bms), 0);
+
+    init_level(&bms, CHG_CRYPT_ROLE_BMS, CHG_CRYPT_PORT_SIF, ID_BMS, CHG_CRYPT_LEVEL_PLAIN);
+    init_level(&chr, CHG_CRYPT_ROLE_CHR, CHG_CRYPT_PORT_SIF, ID_CHR, CHG_CRYPT_LEVEL_HMAC);
+    n = chg_crypt_pack_hello_bms(&bms, f, sizeof f);
+    expect_eq("sif plain hello", n > 0, 1);
+    expect_eq("sif plain rx", (unsigned)chg_crypt_rx_frame(&chr, &w, f, (size_t)n), 1);
+    expect_eq("sif plain suite", chr.suite, CHG_SUITE_PLAIN);
+    i = 300;
+    en = 1;
+    chg_crypt_bind_output(&chr, &i, &en);
+    expect_eq("sif plain amps", i, 300);
+}
+
 int main(void)
 {
+    chg_crypt_install_hmac();
     printf("sizeof ChgSha256 %lu\n", (unsigned long)sizeof(ChgSha256));
     printf("sizeof ChgMacWork %lu\n", (unsigned long)sizeof(ChgMacWork));
     printf("sizeof ChgCrypt %lu\n", (unsigned long)sizeof(ChgCrypt));
@@ -683,6 +815,7 @@ int main(void)
     test_replay_and_bat();
     test_pair();
     test_salt_and_fresh();
+    test_levels();
     if (g_fail) {
         fprintf(stderr, "FAILED\n");
         return 1;
