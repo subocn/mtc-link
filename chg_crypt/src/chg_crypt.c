@@ -6,8 +6,6 @@
 
 #include <string.h>
 
-static const uint8_t ID_ZERO[CHG_CRYPT_ID];
-
 static uint16_t crc16(const uint8_t *data, size_t len)
 {
     uint16_t crc = 0xFFFFu;
@@ -121,14 +119,37 @@ static int listed(const uint8_t *s, uint8_t n, uint8_t v)
     return 0;
 }
 
+#if !CHG_CRYPT_OMIT_HMAC
+/* 文件域指针。chg_crypt_init 的 memset 清的是会话，不清这只指针。 */
+static ChgCryptMacFn mac_fn;
+#endif
+
+void chg_crypt_set_mac(ChgCryptMacFn fn)
+{
+#if CHG_CRYPT_OMIT_HMAC
+    (void)fn;
+#else
+    mac_fn = fn;
+#endif
+}
+
 static int runnable(const ChgCrypt *c, uint8_t s)
 {
     if (s == CHG_SUITE_HMAC) {
-        return 1;
+#if CHG_CRYPT_OMIT_HMAC
+        (void)c;
+        return 0;
+#else
+        return mac_fn != 0;
+#endif
     }
+#if !CHG_CRYPT_OMIT_HMAC
     if (s >= 0x80u && s <= 0xEFu && c->vendor != 0) {
         return 1;
     }
+#else
+    (void)c;
+#endif
     return 0;
 }
 
@@ -236,6 +257,9 @@ static int tag_eq(const uint8_t *a, const uint8_t *b)
     return d == 0;
 }
 
+#if !CHG_CRYPT_OMIT_HMAC
+static const uint8_t ID_ZERO[CHG_CRYPT_ID];
+
 /* 已绑定用出厂对端编号。未绑定用 hello 宣布的编号。一线通的充电机编号为 0。 */
 static void kdf_ids(const ChgCrypt *c, const uint8_t **id_bms, const uint8_t **id_chr)
 {
@@ -253,7 +277,7 @@ static void kdf_ids(const ChgCrypt *c, const uint8_t **id_bms, const uint8_t **i
     *id_bms = c->pair_on ? c->pair_id : c->id_peer;
 }
 
-/* SP 800-108 计数器模式，i = 1，L = 128。结果最左 16 字节写入 sk。与 57 字节共用 w->msg。 */
+/* SP 800-108 计数器模式，i = 1，L = 128。结果最左 16 字节写入 sk。与 57 字节共用 w->blk。 */
 static int derive_sk(ChgCrypt *c, ChgMacWork *w)
 {
     const uint8_t *id_bms;
@@ -262,43 +286,79 @@ static int derive_sk(ChgCrypt *c, ChgMacWork *w)
         return 0;
     }
     kdf_ids(c, &id_bms, &id_chr);
-    memset(w->msg, 0, 48u);
-    w->msg[3] = 0x01u;
-    memcpy(w->msg + 4, "mtc-sk", 6u);
-    memcpy(w->msg + 11, c->salt_bms, CHG_CRYPT_SALT);
-    memcpy(w->msg + 19, c->salt_chr, CHG_CRYPT_SALT);
-    memcpy(w->msg + 27, id_bms, CHG_CRYPT_ID);
-    memcpy(w->msg + 35, id_chr, CHG_CRYPT_ID);
-    w->msg[43] = c->suite;
-    w->msg[47] = 0x80u;
-    chg_hmac_sha256(w, c->key, CHG_CRYPT_KEY, w->msg, 48u, w->dig);
-    memcpy(c->sk, w->dig, CHG_CRYPT_KEY);
+    memset(w->blk, 0, 48u);
+    w->blk[3] = 0x01u;
+    memcpy(w->blk + 4, "mtc-sk", 6u);
+    memcpy(w->blk + 11, c->salt_bms, CHG_CRYPT_SALT);
+    memcpy(w->blk + 19, c->salt_chr, CHG_CRYPT_SALT);
+    memcpy(w->blk + 27, id_bms, CHG_CRYPT_ID);
+    memcpy(w->blk + 35, id_chr, CHG_CRYPT_ID);
+    w->blk[43] = c->suite;
+    w->blk[47] = 0x80u;
+    if (mac_fn == 0 || mac_fn(w, c->key, CHG_CRYPT_KEY, w->blk, 48u, w->blk) == 0) {
+        return 0;
+    }
+    memcpy(c->sk, w->blk, CHG_CRYPT_KEY);
     c->sk_ready = 1u;
     return 1;
 }
 
+#endif /* !CHG_CRYPT_OMIT_HMAC */
+
 static int mac_cover(ChgCrypt *c, ChgMacWork *w, uint32_t counter, uint8_t dir, uint8_t tag[8])
 {
+#if CHG_CRYPT_OMIT_HMAC
+    (void)c;
+    (void)w;
+    (void)counter;
+    (void)dir;
+    (void)tag;
+    return 0;
+#else
     if (!c->sk_ready && !derive_sk(c, w)) {
         return 0;
     }
-    memset(w->msg, 0, 57u);
-    w->msg[0] = c->suite;
-    memcpy(w->msg + 1, c->salt_bms, CHG_CRYPT_SALT);
-    memcpy(w->msg + 9, c->salt_chr, CHG_CRYPT_SALT);
-    w->msg[17] = (uint8_t)(counter & 0xFFu);
-    w->msg[18] = (uint8_t)((counter >> 8) & 0xFFu);
-    w->msg[19] = (uint8_t)((counter >> 16) & 0xFFu);
-    w->msg[20] = (uint8_t)((counter >> 24) & 0xFFu);
-    w->msg[21] = dir;
-    memcpy(w->msg + 22, c->ctrl, CHG_CRYPT_CTRL);
-    w->msg[28] = c->have_bat ? 1u : 0u;
+    memset(w->blk, 0, 57u);
+    w->blk[0] = c->suite;
+    memcpy(w->blk + 1, c->salt_bms, CHG_CRYPT_SALT);
+    memcpy(w->blk + 9, c->salt_chr, CHG_CRYPT_SALT);
+    w->blk[17] = (uint8_t)(counter & 0xFFu);
+    w->blk[18] = (uint8_t)((counter >> 8) & 0xFFu);
+    w->blk[19] = (uint8_t)((counter >> 16) & 0xFFu);
+    w->blk[20] = (uint8_t)((counter >> 24) & 0xFFu);
+    w->blk[21] = dir;
+    memcpy(w->blk + 22, c->ctrl, CHG_CRYPT_CTRL);
+    w->blk[28] = c->have_bat ? 1u : 0u;
     if (c->have_bat) {
-        memcpy(w->msg + 29, c->bat, CHG_CRYPT_BAT);
+        memcpy(w->blk + 29, c->bat, CHG_CRYPT_BAT);
     }
-    chg_hmac_sha256(w, c->sk, CHG_CRYPT_KEY, w->msg, 57u, w->dig);
-    memcpy(tag, w->dig, CHG_CRYPT_TAG);
+    if (mac_fn == 0 || mac_fn(w, c->sk, CHG_CRYPT_KEY, w->blk, 57u, w->blk) == 0) {
+        return 0;
+    }
+    memcpy(tag, w->blk, CHG_CRYPT_TAG);
     return 1;
+#endif
+}
+
+uint8_t chg_crypt_level_suites(uint8_t level, uint8_t *suites, uint8_t cap, uint8_t *flags)
+{
+    if (suites == 0 || cap < 1u) {
+        return 0;
+    }
+#if CHG_CRYPT_OMIT_HMAC
+    (void)level;
+    suites[0] = CHG_SUITE_PLAIN;
+#else
+    if (level == CHG_CRYPT_LEVEL_HMAC && mac_fn != 0) {
+        suites[0] = CHG_SUITE_HMAC;
+    } else {
+        suites[0] = CHG_SUITE_PLAIN;
+    }
+#endif
+    if (flags != 0) {
+        *flags = CHG_CRYPT_F_PLAIN;
+    }
+    return 1u;
 }
 
 void chg_crypt_init(ChgCrypt *c, uint8_t role, uint8_t port,
@@ -376,11 +436,17 @@ void chg_crypt_set_seal(ChgCrypt *c, uint8_t opened)
 
 void chg_crypt_set_vendor(ChgCrypt *c, ChgCryptVendorFn fn, void *user)
 {
+#if CHG_CRYPT_OMIT_HMAC
+    (void)c;
+    (void)fn;
+    (void)user;
+#else
     if (c == 0) {
         return;
     }
     c->vendor = fn;
     c->vendor_user = user;
+#endif
 }
 
 void chg_crypt_set_salt_bms(ChgCrypt *c, const uint8_t salt[CHG_CRYPT_SALT])
@@ -583,6 +649,14 @@ int chg_crypt_pack_token(ChgCrypt *c, ChgMacWork *w, uint8_t *out, size_t cap)
 int chg_crypt_pack_opaque(ChgCrypt *c, const uint8_t *body, uint8_t body_len,
                           uint8_t *out, size_t cap)
 {
+#if CHG_CRYPT_OMIT_HMAC
+    (void)c;
+    (void)body;
+    (void)body_len;
+    (void)out;
+    (void)cap;
+    return -1;
+#else
     uint8_t data[2u + CHG_CRYPT_BODY_MAX];
     if (c == 0 || c->phase != CHG_CRYPT_PH_RUN || c->suite < 0x80u || c->suite > 0xEFu) {
         return -1;
@@ -596,6 +670,7 @@ int chg_crypt_pack_opaque(ChgCrypt *c, const uint8_t *body, uint8_t body_len,
         memcpy(data + 2, body, body_len);
     }
     return frame_pack(CHG_MSG_OPAQUE, data, (uint8_t)(2u + body_len), out, cap);
+#endif
 }
 
 static int on_hello_bms(ChgCrypt *c, const uint8_t *data, uint8_t len)
@@ -623,17 +698,17 @@ static int on_hello_bms(ChgCrypt *c, const uint8_t *data, uint8_t len)
     }
     {
         uint8_t hinted = (uint8_t)(data[0] & (CHG_CRYPT_F_PLAIN | CHG_CRYPT_F_BIDI));
-        if (pick_suite(c, data + 2, n, hinted) == CHG_SUITE_HMAC && salt_zero(data + 6)) {
+        chosen = pick_suite(c, data + 2, n, hinted);
+        if (chosen == CHG_SUITE_HMAC && salt_zero(data + 6)) {
             return -1;
         }
+        drop_sk(c);
+        c->peer_flags = hinted;
     }
-    drop_sk(c);
-    c->peer_flags = (uint8_t)(data[0] & (CHG_CRYPT_F_PLAIN | CHG_CRYPT_F_BIDI));
     c->peer_seal = (data[0] & CHG_CRYPT_F_SEAL) ? 1u : 0u;
     memcpy(c->salt_bms, data + 6, CHG_CRYPT_SALT);
     c->salt_bms_set = 1u;
     memcpy(c->id_peer, data + 14, CHG_CRYPT_ID);
-    chosen = pick_suite(c, data + 2, n, c->peer_flags);
     if (c->port == CHG_CRYPT_PORT_SIF) {
         memset(c->salt_chr, 0, sizeof c->salt_chr);
         c->salt_chr_set = 1u;
@@ -755,10 +830,6 @@ static int on_opaque(ChgCrypt *c, const uint8_t *data, uint8_t len)
 {
     uint8_t suite;
     uint8_t blen;
-    uint8_t msg = 0;
-    uint8_t out[CHG_CRYPT_BAT];
-    uint8_t out_len = 0;
-    int rc;
     if (len < 2u || c->phase != CHG_CRYPT_PH_RUN) {
         return -1;
     }
@@ -767,6 +838,17 @@ static int on_opaque(ChgCrypt *c, const uint8_t *data, uint8_t len)
     if ((uint8_t)(2u + blen) != len || blen > CHG_CRYPT_BODY_MAX) {
         return -1;
     }
+#if CHG_CRYPT_OMIT_HMAC
+    (void)suite;
+    (void)data;
+    note_fail(c);
+    return 1;
+#else
+    {
+    uint8_t msg = 0;
+    uint8_t out[CHG_CRYPT_BAT];
+    uint8_t out_len = 0;
+    int rc;
     if (suite != c->suite || suite < 0x80u || suite > 0xEFu || c->vendor == 0) {
         note_fail(c);
         return 1;
@@ -798,6 +880,8 @@ static int on_opaque(ChgCrypt *c, const uint8_t *data, uint8_t len)
     }
     note_fail(c);
     return 1;
+    }
+#endif
 }
 
 static int on_msg(ChgCrypt *c, ChgMacWork *w, uint8_t msg, const uint8_t *data, uint8_t len)
@@ -1004,4 +1088,54 @@ void chg_crypt_bind_output(const ChgCrypt *c, uint16_t *i_out_01a, uint8_t *enab
         *i_out_01a = 0;
         *enable = 0;
     }
+}
+
+int chg_crypt_observe(ChgCrypt *c, const uint8_t *frame, size_t n)
+{
+    uint8_t msg;
+    uint8_t len;
+    uint16_t crc;
+    uint16_t got;
+    if (c == 0 || frame == 0 || n < 7u) {
+        return 0;
+    }
+    if (frame[0] != 0xA5u || frame[1] != 0x5Au || frame[2] != 0x01u) {
+        return 0;
+    }
+    msg = frame[3];
+    len = frame[4];
+    if (!((msg == 0x01u && len == CHG_CRYPT_CTRL) || (msg == 0x04u && len == CHG_CRYPT_BAT))) {
+        return 0;
+    }
+    if (n < (size_t)len + 7u) {
+        return 0;
+    }
+    crc = crc16(frame, (size_t)len + 5u);
+    got = (uint16_t)(frame[5u + len] | ((uint16_t)frame[6u + len] << 8));
+    if (crc != got) {
+        return 0;
+    }
+    if (msg == 0x01u) {
+        chg_crypt_set_ctrl(c, frame + 5);
+    } else {
+        chg_crypt_set_bat(c, frame + 5);
+    }
+    return 1;
+}
+
+int chg_crypt_cover_ctrl(ChgCrypt *c, ChgMacWork *w, uint8_t ctrl[CHG_CRYPT_CTRL],
+                         const uint8_t *bat, uint8_t *auth, size_t auth_cap)
+{
+    if (c == 0 || ctrl == 0) {
+        return -1;
+    }
+    if (c->role == CHG_CRYPT_ROLE_BMS && !chg_crypt_bms_may_allow(c)) {
+        ctrl[0] = (uint8_t)(ctrl[0] & (uint8_t)~0x01u);
+    }
+    chg_crypt_set_ctrl(c, ctrl);
+    chg_crypt_set_bat(c, bat);
+    if (c->suite != CHG_SUITE_HMAC) {
+        return 0;
+    }
+    return chg_crypt_pack_token(c, w, auth, auth_cap);
 }

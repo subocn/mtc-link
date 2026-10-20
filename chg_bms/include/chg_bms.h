@@ -118,6 +118,7 @@ void bms_link_set_485_short(BmsLink *l, uint8_t shorted, uint32_t dt_ms);
 
 /* RS-485 收充电机的应答。gap_ms 超过 50 ms 丢弃半帧。
  * 只接受等待中的 0x02 或 0x03。超过 80 ms 的应答丢弃。
+ * 不是这两条、但长度仍放得进缓冲的帧整帧收下后丢掉，0x05–0x08 可以同线。
  * 本函数不产生发送帧。一线通调用此函数不会改变会话。 */
 void bms_link_rx_byte(BmsLink *l, uint8_t b, uint32_t gap_ms, const ChgCtrl *ctrl, BmsTx *tx);
 
