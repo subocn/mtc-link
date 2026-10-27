@@ -1,7 +1,8 @@
 /* 作者：苏勃(subo)
  * 充电机侧充电通信。充电机侧实现。
  * 语义见 doc/protocol.md。本工程按充电控制决定输出电流。
- * 电池数据只从 BMS 的 0x04 取得。本工程不估算荷电状态，也不据此改电流。
+ * 电池数据只从 BMS 的 0x04 取得。本工程不估算荷电状态，也不据此改请求电流。
+ * 新鲜有效的 0x04：最大电压高于允许电压，或两侧化学体系都已声明且不同，本周期输出为 0。
  * 一次会话只用一个口：一线通、CAN 或 RS-485。
  */
 #ifndef CHG_CHARGER_H
@@ -56,7 +57,7 @@ typedef struct {
     uint8_t fast_arm;
     uint8_t line_fault;       /* §10 验收 15: 物理断开已锁存。期间输出 0 A，不开上拉 */
     uint8_t aux_fault;        /* 辅助电源欠压满 100 ms。输出保持 0，直到电压恢复 */
-    uint8_t resume_arm;       /* 暂停刚撤销。chr_link_tick 的第一拍电流不超过 20 A，电压先降 1 V */
+    uint8_t resume_arm;       /* 暂停刚撤销。第一拍电流不超过 20 A，电压目标为钳位后的目标再减 1.0 V */
     uint32_t line_down_ms;    /* SIF 拉低 / CAN bus-off / RS-485 短路累计，阈值 100 ms */
     uint32_t aux_uv_ms;
     ChgCap cap;

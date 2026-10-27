@@ -289,7 +289,7 @@ void chg_apply(const ChgCtrl *ctrl, const ChgCap *cap, uint8_t cap_valid, uint8_
     if (i > cap->i_max_01a) {
         i = cap->i_max_01a;
     }
-    /* 低于锁压按请求执行，不得抬回锁压。高出 0.5 V 的请求本周期不出流。 */
+    /* 低于锁压按请求执行，不得抬回锁压。高出超过 0.5 V 的请求本周期不出流。恰好 0.5 V 钳到锁压。 */
     if (v_req_above_lock(v, cap->v_max_01v)) {
         return;
     }
@@ -447,14 +447,15 @@ static void output_of(ChrLink *l, const ChgStat *meas, ChrTx *tx, int consume_re
     ChgCap cap = l->cap;
     cap.ready = l->advertise_ready;
     chg_apply(l->have_ctrl ? &l->ctrl : 0, &cap, cap_valid, link, conflict, fault, &tx->act);
-    /* 新鲜合法的 0x04 只做电压上限和化学体系。不改 chg_apply 的电流。 */
+    /* 新鲜合法的 0x04 只做电压上限和化学体系。不改请求电流。闸门动作时本周期输出为 0。 */
     if (tx->act.enable && !bat_compatible(l)) {
         tx->act.i_out_01a = 0;
         tx->act.v_target_01v = 0;
         tx->act.enable = 0;
     }
     /* GB/T 18487.1-2023 10.7.2：直流接触器再次闭合时冲击电流峰值不超过 20 A。
-     * 暂停恢复的第一拍把电流钳在 20.0 A，电压目标取接口电压减 1 V。 */
+     * 暂停恢复的第一拍把电流钳在 20.0 A。电压目标取已经按锁压钳位后的目标，再减 1.0 V。
+     * 请求不高于锁压时，这就是请求电压减 1.0 V。 */
     if (l->resume_arm && tx->act.enable) {
         if (tx->act.i_out_01a > 200u) {
             tx->act.i_out_01a = 200u;
@@ -662,7 +663,7 @@ static void take_ctrl_frame(ChrLink *l, const uint8_t *frame, uint8_t n, const C
         return;
     }
     if (msg == 0x04u && len == 28u) {
-        /* 电池信息只保存，不刷新 T_loss，也不改当前输出。 */
+        /* 只保存，不刷新 T_loss，不改写请求电流。新鲜有效时按 5.7 重算本周期输出。 */
         remember_bat(l, data);
         output_of(l, meas, tx, 0);
         return;
