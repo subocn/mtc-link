@@ -57,7 +57,7 @@ typedef struct {
     uint8_t fast_arm;
     uint8_t line_fault;       /* §10 验收 15: 物理断开已锁存。期间输出 0 A，不开上拉 */
     uint8_t aux_fault;        /* 辅助电源欠压满 100 ms。输出保持 0，直到电压恢复 */
-    uint8_t resume_arm;       /* 暂停刚撤销。chr_link_tick 的第一拍电流不超过 20 A，电压先降 1 V */
+    uint8_t resume_arm;       /* 暂停刚撤销。第一拍电流不超过 20 A，电压目标为钳位后的目标再减 1.0 V */
     uint32_t line_down_ms;    /* SIF 拉低 / CAN bus-off / RS-485 短路累计，阈值 100 ms */
     uint32_t aux_uv_ms;
     ChgCap cap;

@@ -1586,6 +1586,19 @@ static void test_defined_values(void)
     pack_01_vi(0x01, 1005, 400, frame);
     feed(&link, &st, frame, sizeof frame, &tx);
     expect_eq("485 half volt", tx.act.v_target_01v, 1000);
+    pack_01_vi(0x03, 1005, 400, frame);
+    feed(&link, &st, frame, sizeof frame, &tx);
+    expect_eq("485 half pause", tx.act.enable, 0);
+    expect_eq("485 half pause run", tx.phase, CHG_PHASE_RUN);
+    pack_01_vi(0x01, 1005, 400, frame);
+    feed(&link, &st, frame, sizeof frame, &tx);
+    expect_eq("485 half resume i", tx.act.i_out_01a, 200);
+    expect_eq("485 half resume v", tx.act.v_target_01v, 990);
+    expect_eq("485 half resume saved", link.ctrl.v_req_01v, 1005);
+    expect_eq("485 half resume arm", link.resume_arm, 1u);
+    chr_link_tick(&link, &st, 0, &tx);
+    expect_eq("485 half resume tick v", tx.act.v_target_01v, 990);
+    expect_eq("485 half resume clear", link.resume_arm, 0u);
 
     chr_link_init(&link, CHG_PORT_SIF, &cap);
     chr_link_tick(&link, &st, 0, &tx);
