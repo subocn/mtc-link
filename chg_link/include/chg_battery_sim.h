@@ -1,4 +1,5 @@
 /* 作者：苏勃(subo)
+ * SPDX-License-Identifier: Apache-2.0
  * 共享简化电池模型 — 给 chg_evcc 桩侧模拟器与 e2e harness 同时用。
  *
  * 设计目标：在主机进程里把 "充电器接到电池上" 的物理行为近似出来，

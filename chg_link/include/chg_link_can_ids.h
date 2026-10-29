@@ -1,4 +1,5 @@
 /* 作者：苏勃(subo)
+ * SPDX-License-Identifier: Apache-2.0
  * 共享的 BMS↔充电机 CAN 标识符。
  *
  * 两边工程目录独立（chg_bms / chg_charger），但 CAN 标识符必须完全一致。

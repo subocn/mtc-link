@@ -1,4 +1,5 @@
 # 作者：苏勃(subo)
+# SPDX-License-Identifier: Apache-2.0
 # e2e：背靠背 harness（chg_bms ↔ chg_charger）
 # 作者：苏勃(subo)
 #

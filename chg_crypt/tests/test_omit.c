@@ -1,4 +1,5 @@
 /* 作者：苏勃(subo)
+ * SPDX-License-Identifier: Apache-2.0
  * 去掉 HMAC 的映像。不链接 chg_sha256.c。
  */
 #include "chg_crypt.h"

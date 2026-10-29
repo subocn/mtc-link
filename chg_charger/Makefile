@@ -1,4 +1,5 @@
 # 作者：苏勃(subo)
+# SPDX-License-Identifier: Apache-2.0
 # 充电机侧充电通信
 # 作者：苏勃(subo)
 CC ?= gcc

@@ -1,4 +1,5 @@
 /* 作者：苏勃(subo)
+ * SPDX-License-Identifier: Apache-2.0
  * 共享简化电池模型实现。
  *
  * 从 firmware/chg_evcc/sim/sim.c §B 抽出。公式与常数不动 — 上一轮自审

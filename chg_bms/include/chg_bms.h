@@ -1,4 +1,5 @@
 /* 作者：苏勃(subo)
+ * SPDX-License-Identifier: Apache-2.0
  * BMS 侧充电通信。BMS 侧实现。
  * 语义见 doc/protocol.md。本工程不计算输出电流。
  * 电池信息只在 0x04 里发给充电机，不参与充电控制。
