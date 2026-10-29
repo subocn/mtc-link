@@ -1,4 +1,5 @@
 /* 作者：苏勃(subo)
+ * SPDX-License-Identifier: Apache-2.0
  * e2e：背靠背 harness。把 chg_bms 与 chg_charger 链到一个进程里跑，
  * 按规范 §3 的 10 拍序列（HS→RUN→PAUSE→RESUME→STOP→重握）走一遍。
  *

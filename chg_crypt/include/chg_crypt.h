@@ -1,4 +1,5 @@
 /* 作者：苏勃(subo)
+ * SPDX-License-Identifier: Apache-2.0
  * 通信令牌。套件 0x00 与 0x01 在本文件。厂商套件 0x80–0xEF 只留钩子。
  *
  * 无堆。ChgCrypt 与 ChgMacWork 由调用方提供，可放在静态存储。

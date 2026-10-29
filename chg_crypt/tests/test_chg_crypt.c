@@ -1,4 +1,6 @@
-/* 作者：苏勃(subo) */
+/* 作者：苏勃(subo)
+ * SPDX-License-Identifier: Apache-2.0
+ */
 #include "chg_crypt.h"
 
 #include <stdio.h>

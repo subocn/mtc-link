@@ -1,4 +1,5 @@
 /* 作者：苏勃(subo)
+ * SPDX-License-Identifier: Apache-2.0
  * 令牌外壳接到已经组好的明文帧。明文相位机不因 0x05 / 0x07 前进。
  */
 #include "chg_crypt.h"

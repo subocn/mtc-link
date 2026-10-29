@@ -1,4 +1,5 @@
 /* 作者：苏勃(subo)
+ * SPDX-License-Identifier: Apache-2.0
  * 紧凑 SHA-256 与 HMAC-SHA256。工作区由调用方持有，函数内不分配内存。
  */
 #include "chg_crypt.h"

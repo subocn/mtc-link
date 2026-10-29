@@ -1,4 +1,5 @@
 # 作者：苏勃(subo)
+# SPDX-License-Identifier: Apache-2.0
 # 令牌套件 0x00 / 0x01，以及厂商套件外壳
 CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -Iinclude -I../chg_link/include

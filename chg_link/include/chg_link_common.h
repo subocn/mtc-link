@@ -1,4 +1,5 @@
 /* 作者：苏勃(subo)
+ * SPDX-License-Identifier: Apache-2.0
  * BMS↔充电机 之间共享的数据结构。
  *
  * 两边工程（chg_bms、chg_charger）独立分发，但这些 struct 字段必须一致：

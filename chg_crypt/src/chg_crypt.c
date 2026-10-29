@@ -1,4 +1,5 @@
 /* 作者：苏勃(subo)
+ * SPDX-License-Identifier: Apache-2.0
  * 套件选择、0x05–0x08 组帧和出流闸门。HMAC 见 chg_sha256.c。
  * 套件 0x01 的标签用会话密钥。长期密钥只按 SP 800-108 派生这一把。
  */
