@@ -122,28 +122,53 @@ typedef struct {
 /* 交流进线允许电流，0.1 A。kind 只接受国标交流或欧标交流，否则返回 0。
  * cp_nominal_mv 不是 6000 时返回 0。duty_permille 里 533 表示 53.3%。
  * ohm 只认 1500、680、220、100，其他返回 0。100 Ω 单相返回 32.0 A，不取 63 A。
+ * 高于 85% 至 97% 的标准高档（含 80 A）本链路不取。
  * rated_inlet_01a 为调用方给出的进线额定，0 表示未知，返回 0。
- * 结果是占空比电流、电缆档和额定的最小者。不改写已保存的 0x01。 */
+ * digital_valid 为 1 时再与 digital_01a 取较小者；digital_01a 为 0 则结果为 0。
+ * digital_valid 为 0 时不另造数字限流。模拟电流为 0 时直接返回 0，
+ * 数字限流不把 3% 至 7%、高于 7% 且低于 8%、高于 85% 改成可取电。
+ * 不改写已保存的 0x01。 */
 uint16_t chg_ac_inlet_01a(uint8_t kind, uint16_t cp_nominal_mv, uint16_t duty_permille,
-                          uint16_t ohm, uint16_t rated_inlet_01a);
+                          uint16_t ohm, uint16_t rated_inlet_01a, uint8_t digital_valid,
+                          uint16_t digital_01a);
 
-/* 电池侧电流只下调，0.1 A。任一参数为 0 则返回 0。结果不超过 i_req_01a。
- * eff_permille 由符合表传入，1000 表示 100%。本函数不另定系数。
+/* 电池侧电流只下调，0.1 A。请求、电压或进线电流为 0 则返回 0。结果不超过 i_req_01a。
+ * eff_permille 由符合表传入，1000 表示 100%。大于 1000 或为 0 时返回 0。本函数不另定系数。
+ * 上限向下取整，避免四舍五入后超过进线功率。
+ * v_ac_min_01v 与 v_ac_max_01v 都为 0 时不检查交流电压窗口，也不另定上下限。
+ * 只传入一端，或下限高于上限，或实测落在窗口外，返回 0。
  * 不得把进线安培数原样当成电池侧电流。 */
 uint16_t chg_ac_batt_01a(uint16_t i_req_01a, uint16_t v_batt_01v, uint16_t v_ac_01v,
-                         uint16_t i_inlet_01a, uint16_t eff_permille);
+                         uint16_t i_inlet_01a, uint16_t eff_permille, uint16_t v_ac_min_01v,
+                         uint16_t v_ac_max_01v);
 
 /* 直流桩目标。国标直流与欧标直流量值用同一函数。out 为空则直接返回。
- * 窗口任一端为 0，或下限高于上限，则 send 为 0。eff_permille 为 0 则 send 为 0。
- * v_inlet_01v 为 0 表示没有进线实测。i_pile_max_01a 为 0 表示不另限桩能力。
- * 进线在窗口内用进线；没有实测且上一次目标在窗口内时用上一次；
- * 没有实测也没有可用的上一次时用窗口下限。进线在窗口外则 send 为 0，不得钳进窗口。
- * 电池请求电压或电流为 0 时 send 为 0。暂停且上一次电压在窗口内、上一次电流非 0 时原样回送。
+ * 本机输入窗口、桩输出电压范围、桩电流范围，任一端为 0 或下限高于上限，则 send 为 0。
+ * eff_permille 为 0 或大于 1000 则 send 为 0。两个窗口没有交集则 send 为 0。
+ * 进线落在交集内用进线。进线在本机窗口内但高于交集上限时，向下取交集上限。
+ * 进线在本机窗口内但低于交集下限时，取交集下限。进线在本机窗口外则 send 为 0，
+ * 不得把窗口外的电压抬进窗口。没有实测时，上一次目标仍在交集内则用上一次，否则用交集下限。
+ * 电流按电池侧功率除以目标电压向上取整，再与桩最大电流取较小者。
+ * 小于桩最小电流时 send 为 0，不发一帧会让桩按最小能力续出的需求。
+ * 暂停时电压保持上一次仍在交集内的值，不改成电池口电压，也不改成 0。
+ * 暂停电流高于桩最大电流时只向下钳；低于桩最小电流，或上一次电压不在交集内，则 send 为 0。
  * 目标电压不取电池口请求电压。 */
 void chg_dc_pile_demand(uint8_t kind, uint16_t v_win_lo_01v, uint16_t v_win_hi_01v,
                         uint16_t v_inlet_01v, uint16_t v_batt_01v, uint16_t i_batt_01a,
-                        uint16_t eff_permille, uint16_t i_pile_max_01a, uint8_t pause,
+                        uint16_t eff_permille, uint16_t v_pile_min_01v, uint16_t v_pile_max_01v,
+                        uint16_t i_pile_min_01a, uint16_t i_pile_max_01a, uint8_t pause,
                         uint16_t v_prev_01v, uint16_t i_prev_01a, ChgPileDemand *out);
+
+/* 国标直流公共桩 CAN 的充电电流原始值。物理值为负，原始值 = 4000 − i_01a。
+ * 40.0 A 充电得到 3600，不是本链路 BCL 的 4400。恰好 400.0 A 得到 0。
+ * 大于 400.0 A，或 raw 为空，返回 0，且不写出原始值。
+ * 0 A 得到 4000；调用方仍不得发送电流为 0 的需求帧。欧标 EXI 不用这个原始值。 */
+uint8_t chg_gb_dc_i_raw(uint16_t i_01a, uint16_t *raw);
+
+/* 国标直流公共桩 CAN 电流的反向换算，得到正的 0.1 A 充电计数。
+ * 原始值大于 4000 时失败，且不写出。不得把本链路 BCL 的 4400 当成 40.0 A 充电。
+ * 恰好 4000 得到 0 A。恰好 0 得到 400.0 A。i_01a 为空时返回 0。欧标 EXI 不用。 */
+uint8_t chg_gb_dc_i_phys(uint16_t raw, uint16_t *i_01a);
 
 /* cap 是本机输出能力。一线通把书面限值放在这里。就绪位由会话改写。
  * 初始化后为 OFF。第一次 tick 进入握手。 */

@@ -306,16 +306,34 @@ void chg_apply(const ChgCtrl *ctrl, const ChgCap *cap, uint8_t cap_valid, uint8_
     act->enable = 1;
 }
 
-static uint16_t div_round_half_up(uint64_t n, uint64_t d)
+/* 放得进 uint16 才写出。上限用向下取整，避免结果高过进线功率。 */
+static int div_floor_u16(uint64_t n, uint64_t d, uint16_t *out)
 {
-    if (d == 0u) {
-        return 0u;
+    if (d == 0u || out == 0) {
+        return 0;
     }
-    n = (n + d / 2u) / d;
+    n /= d;
     if (n > 65535u) {
-        return 65535u;
+        return 0;
     }
-    return (uint16_t)n;
+    *out = (uint16_t)n;
+    return 1;
+}
+
+/* 直流请求向上取整，使桩侧功率盖住电池侧请求。恰好整除时不进位。 */
+static int div_ceil_u16(uint64_t n, uint64_t d, uint16_t *out)
+{
+    uint64_t q;
+
+    if (d == 0u || out == 0) {
+        return 0;
+    }
+    q = (n + d - 1u) / d;
+    if (q > 65535u) {
+        return 0;
+    }
+    *out = (uint16_t)q;
+    return 1;
 }
 
 /* 本链路交流口：8% 至不足 10% 为 6 A；10% 至 85% 为百分数 × 0.6 A。
@@ -370,10 +388,12 @@ static uint16_t u16_min(uint16_t a, uint16_t b)
 }
 
 uint16_t chg_ac_inlet_01a(uint8_t kind, uint16_t cp_nominal_mv, uint16_t duty_permille,
-                          uint16_t ohm, uint16_t rated_inlet_01a)
+                          uint16_t ohm, uint16_t rated_inlet_01a, uint8_t digital_valid,
+                          uint16_t digital_01a)
 {
     uint16_t duty_i;
     uint16_t cable_i;
+    uint16_t i;
 
     if (kind != CHG_PILE_GB_AC && kind != CHG_PILE_EU_AC) {
         return 0u;
@@ -386,21 +406,34 @@ uint16_t chg_ac_inlet_01a(uint8_t kind, uint16_t cp_nominal_mv, uint16_t duty_pe
     if (duty_i == 0u || cable_i == 0u) {
         return 0u;
     }
-    return u16_min(duty_i, u16_min(cable_i, rated_inlet_01a));
+    i = u16_min(duty_i, u16_min(cable_i, rated_inlet_01a));
+    if (digital_valid != 0u) {
+        i = u16_min(i, digital_01a);
+    }
+    return i;
 }
 
 uint16_t chg_ac_batt_01a(uint16_t i_req_01a, uint16_t v_batt_01v, uint16_t v_ac_01v,
-                         uint16_t i_inlet_01a, uint16_t eff_permille)
+                         uint16_t i_inlet_01a, uint16_t eff_permille, uint16_t v_ac_min_01v,
+                         uint16_t v_ac_max_01v)
 {
     uint16_t i_max;
 
     if (i_req_01a == 0u || v_batt_01v == 0u || v_ac_01v == 0u || i_inlet_01a == 0u ||
-        eff_permille == 0u) {
+        eff_permille == 0u || eff_permille > 1000u) {
         return 0u;
     }
-    /* i_max = 进线电流 × 进线电压 × 效率 / 电池电压。效率是千分比。 */
-    i_max = div_round_half_up((uint64_t)i_inlet_01a * v_ac_01v * eff_permille,
-                              (uint64_t)v_batt_01v * 1000u);
+    if (v_ac_min_01v != 0u || v_ac_max_01v != 0u) {
+        if (v_ac_min_01v == 0u || v_ac_max_01v == 0u || v_ac_min_01v > v_ac_max_01v ||
+            v_ac_01v < v_ac_min_01v || v_ac_01v > v_ac_max_01v) {
+            return 0u;
+        }
+    }
+    /* i_max = 进线电流 × 进线电压 × 效率 / 电池电压。效率是千分比。向下取整。 */
+    if (!div_floor_u16((uint64_t)i_inlet_01a * v_ac_01v * eff_permille,
+                       (uint64_t)v_batt_01v * 1000u, &i_max)) {
+        return 0u;
+    }
     return u16_min(i_max, i_req_01a);
 }
 
@@ -416,11 +449,42 @@ static void demand_clear(ChgPileDemand *out)
     out->i_01a = 0u;
 }
 
+/* 本机输入窗口与桩输出范围的交集。没有交集时返回 0。 */
+static int intersect_window(uint16_t a_lo, uint16_t a_hi, uint16_t b_lo, uint16_t b_hi,
+                            uint16_t *lo, uint16_t *hi)
+{
+    uint16_t l;
+    uint16_t h;
+
+    l = a_lo > b_lo ? a_lo : b_lo;
+    h = a_hi < b_hi ? a_hi : b_hi;
+    if (l > h || lo == 0 || hi == 0) {
+        return 0;
+    }
+    *lo = l;
+    *hi = h;
+    return 1;
+}
+
+static int pile_limits_ok(uint16_t v_lo, uint16_t v_hi, uint16_t i_lo, uint16_t i_hi)
+{
+    if (v_lo == 0u || v_hi == 0u || v_lo > v_hi) {
+        return 0;
+    }
+    if (i_lo == 0u || i_hi == 0u || i_lo > i_hi) {
+        return 0;
+    }
+    return 1;
+}
+
 void chg_dc_pile_demand(uint8_t kind, uint16_t v_win_lo_01v, uint16_t v_win_hi_01v,
                         uint16_t v_inlet_01v, uint16_t v_batt_01v, uint16_t i_batt_01a,
-                        uint16_t eff_permille, uint16_t i_pile_max_01a, uint8_t pause,
+                        uint16_t eff_permille, uint16_t v_pile_min_01v, uint16_t v_pile_max_01v,
+                        uint16_t i_pile_min_01a, uint16_t i_pile_max_01a, uint8_t pause,
                         uint16_t v_prev_01v, uint16_t i_prev_01a, ChgPileDemand *out)
 {
+    uint16_t lo;
+    uint16_t hi;
     uint16_t v;
     uint16_t i;
 
@@ -434,38 +498,77 @@ void chg_dc_pile_demand(uint8_t kind, uint16_t v_win_lo_01v, uint16_t v_win_hi_0
     if (v_win_lo_01v == 0u || v_win_hi_01v == 0u || v_win_lo_01v > v_win_hi_01v) {
         return;
     }
-    if (pause != 0u && i_prev_01a != 0u && in_window(v_prev_01v, v_win_lo_01v, v_win_hi_01v)) {
-        out->send = 1u;
-        out->v_01v = v_prev_01v;
-        out->i_01a = i_prev_01a;
+    if (!pile_limits_ok(v_pile_min_01v, v_pile_max_01v, i_pile_min_01a, i_pile_max_01a)) {
         return;
     }
-    if (v_batt_01v == 0u || i_batt_01a == 0u || eff_permille == 0u) {
+    if (!intersect_window(v_win_lo_01v, v_win_hi_01v, v_pile_min_01v, v_pile_max_01v, &lo, &hi)) {
+        return;
+    }
+    if (pause != 0u) {
+        if (i_prev_01a == 0u || !in_window(v_prev_01v, lo, hi)) {
+            return;
+        }
+        i = i_prev_01a;
+        if (i > i_pile_max_01a) {
+            i = i_pile_max_01a;
+        }
+        if (i < i_pile_min_01a) {
+            return;
+        }
+        out->send = 1u;
+        out->v_01v = v_prev_01v;
+        out->i_01a = i;
+        return;
+    }
+    if (eff_permille == 0u || eff_permille > 1000u || v_batt_01v == 0u || i_batt_01a == 0u) {
         return;
     }
     if (v_inlet_01v != 0u && in_window(v_inlet_01v, v_win_lo_01v, v_win_hi_01v)) {
-        v = v_inlet_01v;
-    } else if (v_inlet_01v == 0u && in_window(v_prev_01v, v_win_lo_01v, v_win_hi_01v)) {
+        if (in_window(v_inlet_01v, lo, hi)) {
+            v = v_inlet_01v;
+        } else if (v_inlet_01v > hi) {
+            v = hi;
+        } else {
+            v = lo;
+        }
+    } else if (v_inlet_01v == 0u && in_window(v_prev_01v, lo, hi)) {
         v = v_prev_01v;
     } else if (v_inlet_01v == 0u) {
-        v = v_win_lo_01v;
+        v = lo;
     } else {
         return;
     }
-    i = div_round_half_up((uint64_t)v_batt_01v * i_batt_01a * 1000u,
-                          (uint64_t)eff_permille * v);
-    if (i == 0u) {
+    if (!div_ceil_u16((uint64_t)v_batt_01v * i_batt_01a * 1000u, (uint64_t)eff_permille * v, &i) ||
+        i == 0u) {
         return;
     }
-    if (i_pile_max_01a != 0u && i > i_pile_max_01a) {
+    if (i > i_pile_max_01a) {
         i = i_pile_max_01a;
     }
-    if (i == 0u) {
+    if (i < i_pile_min_01a) {
         return;
     }
     out->send = 1u;
     out->v_01v = v;
     out->i_01a = i;
+}
+
+uint8_t chg_gb_dc_i_raw(uint16_t i_01a, uint16_t *raw)
+{
+    if (raw == 0 || i_01a > 4000u) {
+        return 0u;
+    }
+    *raw = (uint16_t)(4000u - i_01a);
+    return 1u;
+}
+
+uint8_t chg_gb_dc_i_phys(uint16_t raw, uint16_t *i_01a)
+{
+    if (i_01a == 0 || raw > 4000u) {
+        return 0u;
+    }
+    *i_01a = (uint16_t)(4000u - raw);
+    return 1u;
 }
 
 /* 无新鲜合法 0x04 时返回 1，家充仍按 0x01。允许电流不参与。 */
