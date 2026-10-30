@@ -100,6 +100,51 @@ int chr_link_bat(const ChrLink *l, ChgBat *out);
 void chg_apply(const ChgCtrl *ctrl, const ChgCap *cap, uint8_t cap_valid, uint8_t link_ok,
                uint8_t paths_conflict, uint8_t charger_fault, ChgAct *act);
 
+/* 桩侧种类。交流函数不接受直流，直流函数不接受交流。 */
+#define CHG_PILE_GB_AC 1u
+#define CHG_PILE_EU_AC 2u
+#define CHG_PILE_GB_DC 3u
+#define CHG_PILE_EU_DC 4u
+
+/* 控制导引已分类的标称电压，单位 mV。只认这五档，不在这里另造容差带。 */
+#define CHG_CP_FAULT_MV 0u
+#define CHG_CP_VENT_MV 3000u
+#define CHG_CP_READY_MV 6000u
+#define CHG_CP_PRESENT_MV 9000u
+#define CHG_CP_OPEN_MV 12000u
+
+typedef struct {
+    uint8_t send; /* 0：不发桩侧电压电流请求。调用方发停止，不发电流为 0 的需求帧 */
+    uint16_t v_01v;
+    uint16_t i_01a;
+} ChgPileDemand;
+
+/* 交流进线允许电流，0.1 A。kind 只接受国标交流或欧标交流，否则返回 0。
+ * cp_nominal_mv 不是 6000 时返回 0。duty_permille 里 533 表示 53.3%。
+ * ohm 只认 1500、680、220、100，其他返回 0。100 Ω 单相返回 32.0 A，不取 63 A。
+ * rated_inlet_01a 为调用方给出的进线额定，0 表示未知，返回 0。
+ * 结果是占空比电流、电缆档和额定的最小者。不改写已保存的 0x01。 */
+uint16_t chg_ac_inlet_01a(uint8_t kind, uint16_t cp_nominal_mv, uint16_t duty_permille,
+                          uint16_t ohm, uint16_t rated_inlet_01a);
+
+/* 电池侧电流只下调，0.1 A。任一参数为 0 则返回 0。结果不超过 i_req_01a。
+ * eff_permille 由符合表传入，1000 表示 100%。本函数不另定系数。
+ * 不得把进线安培数原样当成电池侧电流。 */
+uint16_t chg_ac_batt_01a(uint16_t i_req_01a, uint16_t v_batt_01v, uint16_t v_ac_01v,
+                         uint16_t i_inlet_01a, uint16_t eff_permille);
+
+/* 直流桩目标。国标直流与欧标直流量值用同一函数。out 为空则直接返回。
+ * 窗口任一端为 0，或下限高于上限，则 send 为 0。eff_permille 为 0 则 send 为 0。
+ * v_inlet_01v 为 0 表示没有进线实测。i_pile_max_01a 为 0 表示不另限桩能力。
+ * 进线在窗口内用进线；没有实测且上一次目标在窗口内时用上一次；
+ * 没有实测也没有可用的上一次时用窗口下限。进线在窗口外则 send 为 0，不得钳进窗口。
+ * 电池请求电压或电流为 0 时 send 为 0。暂停且上一次电压在窗口内、上一次电流非 0 时原样回送。
+ * 目标电压不取电池口请求电压。 */
+void chg_dc_pile_demand(uint8_t kind, uint16_t v_win_lo_01v, uint16_t v_win_hi_01v,
+                        uint16_t v_inlet_01v, uint16_t v_batt_01v, uint16_t i_batt_01a,
+                        uint16_t eff_permille, uint16_t i_pile_max_01a, uint8_t pause,
+                        uint16_t v_prev_01v, uint16_t i_prev_01a, ChgPileDemand *out);
+
 /* cap 是本机输出能力。一线通把书面限值放在这里。就绪位由会话改写。
  * 初始化后为 OFF。第一次 tick 进入握手。 */
 void chr_link_init(ChrLink *l, uint8_t port, const ChgCap *cap);
