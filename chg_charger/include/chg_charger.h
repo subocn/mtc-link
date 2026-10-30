@@ -189,6 +189,35 @@ uint16_t chg_dc_batt_01a(uint16_t i_req_01a, uint16_t v_batt_01v, uint16_t v_pil
  * 最小解出 0 表示没有下限。欧标 EXI 不用。 */
 uint8_t chg_gb_dc_cml_i(uint16_t raw_max, uint16_t raw_min, uint16_t *i_min, uint16_t *i_max);
 
+/* 充电结束后能否再开一回桩侧握手。暂停不是结束。本函数不读 CC2、CP，不组帧。 */
+#define CHG_PILE_END_PAUSE  0u /* 同会话保持。不断流结束，也不新开握手 */
+#define CHG_PILE_END_NORMAL 1u /* 已经断流并离开能量传输。仍连接时可以重新握手 */
+#define CHG_PILE_END_REPLUG 2u /* 必须先断开再连接。含 BSM 超时，以及绝缘、连接器、单体过压、单体欠压 */
+#define CHG_PILE_END_RETRY  3u /* 仅国标直流处理方式 c。次数用尽后与必须拔枪相同 */
+
+/* 调用方已经分类的插头。 */
+#define CHG_PLUG_HELD     0u /* 结束后仍连接，没有见过断开 */
+#define CHG_PLUG_OPEN     1u /* 当前已经断开，还没有再次连接 */
+#define CHG_PLUG_RESEATED 2u /* 结束后见过断开，并且已经再次连接 */
+
+typedef struct {
+    uint8_t cut;     /* 1：断流并离开能量传输。0：留在原会话 */
+    uint8_t restart; /* 1：允许开始下一次桩侧握手 */
+} ChgPileRestart;
+
+/* kind 用 CHG_PILE_*。reason 用 CHG_PILE_END_*。plug 用 CHG_PLUG_*。
+ * retries_left 只在处理方式 c 时表示还剩的重握次数，其他原因不看。
+ * out 为空则直接返回。种类、原因或插头无法识别时 cut 为 1、restart 为 0。
+ * 暂停时 cut 为 0、restart 为 0：不得发结束报文，也不得要求拔枪。
+ * 正常结束时 cut 为 1。插头仍连接或已经重新连接则 restart 为 1；当前断开为 0。
+ * 交流正常结束不要求拔枪。国标直流正常结束可以在仍连接时重新握手。
+ * 欧标直流未把 ISO 15118-2 写成 Pause 时，停止用正常结束。Pause 用暂停。
+ * 必须拔枪时，只有已经重新连接才 restart 为 1。
+ * 处理方式 c 只接受国标直流。次数还在、且插头不是当前断开时 restart 为 1。
+ * 次数为 0 时与必须拔枪相同。交流或欧标直流传入该原因则 restart 为 0。 */
+void chg_pile_restart(uint8_t kind, uint8_t reason, uint8_t plug,
+                      uint8_t retries_left, ChgPileRestart *out);
+
 /* cap 是本机输出能力。一线通把书面限值放在这里。就绪位由会话改写。
  * 初始化后为 OFF。第一次 tick 进入握手。 */
 void chr_link_init(ChrLink *l, uint8_t port, const ChgCap *cap);

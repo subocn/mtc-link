@@ -2033,6 +2033,50 @@ static void test_dc_pile(void)
     chg_dc_pile_demand(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
+static void expect_restart(const char *name, uint8_t kind, uint8_t reason, uint8_t plug,
+                            uint8_t retries, uint8_t cut, uint8_t restart)
+{
+    ChgPileRestart r;
+    r.cut = 9u;
+    r.restart = 9u;
+    chg_pile_restart(kind, reason, plug, retries, &r);
+    expect_eq(name, ((unsigned long)r.cut << 1) | r.restart,
+              ((unsigned long)cut << 1) | restart);
+}
+
+static void test_pile_restart(void)
+{
+    chg_pile_restart(CHG_PILE_GB_DC, CHG_PILE_END_NORMAL, CHG_PLUG_HELD, 0, 0);
+
+    expect_restart("pause ac", CHG_PILE_GB_AC, CHG_PILE_END_PAUSE, CHG_PLUG_HELD, 0, 0, 0);
+    expect_restart("pause dc", CHG_PILE_GB_DC, CHG_PILE_END_PAUSE, CHG_PLUG_OPEN, 3, 0, 0);
+    expect_restart("pause eu", CHG_PILE_EU_DC, CHG_PILE_END_PAUSE, CHG_PLUG_HELD, 0, 0, 0);
+
+    expect_restart("ac held", CHG_PILE_GB_AC, CHG_PILE_END_NORMAL, CHG_PLUG_HELD, 0, 1, 1);
+    expect_restart("eu ac open", CHG_PILE_EU_AC, CHG_PILE_END_NORMAL, CHG_PLUG_OPEN, 0, 1, 0);
+    expect_restart("ac reseat", CHG_PILE_EU_AC, CHG_PILE_END_NORMAL, CHG_PLUG_RESEATED, 0, 1, 1);
+    expect_restart("gb dc held", CHG_PILE_GB_DC, CHG_PILE_END_NORMAL, CHG_PLUG_HELD, 0, 1, 1);
+    expect_restart("eu dc held", CHG_PILE_EU_DC, CHG_PILE_END_NORMAL, CHG_PLUG_HELD, 0, 1, 1);
+    expect_restart("dc open", CHG_PILE_GB_DC, CHG_PILE_END_NORMAL, CHG_PLUG_OPEN, 0, 1, 0);
+
+    expect_restart("replug held", CHG_PILE_GB_DC, CHG_PILE_END_REPLUG, CHG_PLUG_HELD, 0, 1, 0);
+    expect_restart("replug open", CHG_PILE_GB_DC, CHG_PILE_END_REPLUG, CHG_PLUG_OPEN, 0, 1, 0);
+    expect_restart("replug seated", CHG_PILE_GB_DC, CHG_PILE_END_REPLUG, CHG_PLUG_RESEATED, 0, 1, 1);
+    expect_restart("ac replug held", CHG_PILE_GB_AC, CHG_PILE_END_REPLUG, CHG_PLUG_HELD, 0, 1, 0);
+
+    expect_restart("retry left", CHG_PILE_GB_DC, CHG_PILE_END_RETRY, CHG_PLUG_HELD, 1, 1, 1);
+    expect_restart("retry zero", CHG_PILE_GB_DC, CHG_PILE_END_RETRY, CHG_PLUG_HELD, 0, 1, 0);
+    expect_restart("retry open", CHG_PILE_GB_DC, CHG_PILE_END_RETRY, CHG_PLUG_OPEN, 2, 1, 0);
+    expect_restart("retry reseat", CHG_PILE_GB_DC, CHG_PILE_END_RETRY, CHG_PLUG_RESEATED, 0, 1, 1);
+    expect_restart("ac retry", CHG_PILE_EU_AC, CHG_PILE_END_RETRY, CHG_PLUG_HELD, 2, 1, 0);
+    expect_restart("eu dc retry", CHG_PILE_EU_DC, CHG_PILE_END_RETRY, CHG_PLUG_HELD, 2, 1, 0);
+
+    expect_restart("bad kind", 0, CHG_PILE_END_NORMAL, CHG_PLUG_HELD, 0, 1, 0);
+    expect_restart("bad plug", CHG_PILE_GB_DC, CHG_PILE_END_NORMAL, 9, 0, 1, 0);
+    expect_restart("bad reason", CHG_PILE_GB_AC, 9, CHG_PLUG_HELD, 0, 1, 0);
+    expect_restart("pause bad kind", 0, CHG_PILE_END_PAUSE, CHG_PLUG_HELD, 0, 1, 0);
+}
+
 int main(void)
 {
     test_apply();
@@ -2059,6 +2103,7 @@ int main(void)
     test_ac_inlet();
     test_ac_batt();
     test_dc_pile();
+    test_pile_restart();
     if (g_fail) {
         return 1;
     }
