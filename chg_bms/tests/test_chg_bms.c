@@ -1290,6 +1290,72 @@ static void test_skip_auth(void)
     expect_eq("auth then cap", link.phase, CHG_PHASE_RUN);
 }
 
+/* 满充停止由策略把停止和请求电流保持住。本链路在此期间只发 BST，不发 BRO。
+ * 允许和电流回来后，第一拍仍是握手：BRO 为 00，电流字段为 0。
+ * 停止期间先收到 CRO 为 AA，也不跳过这次握手。 */
+static void test_full_stop_rehandshake(void)
+{
+    BmsLink link;
+    BmsTx tx;
+    ChgCtrl c = energy();
+    ChgCan rx;
+    int i;
+    int bcl;
+    int bro;
+
+    bms_link_init(&link, CHG_PORT_CAN);
+    bms_link_tick(&link, &c, 0, &tx);
+    memset(&rx, 0, sizeof rx);
+    rx.id = CHG_CAN_CRO;
+    rx.dlc = 1;
+    rx.data[0] = 0xAA;
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 250, &tx);
+    expect_eq("full hold starts in run", tx.phase, CHG_PHASE_RUN);
+
+    c.allow = 0;
+    c.stop = 1;
+    c.i_req_01a = 0;
+    bms_link_tick(&link, &c, 10, &tx);
+    expect_eq("full hold stop", tx.phase, CHG_PHASE_STOP);
+    expect_eq("full hold bst", find_can(&tx, CHG_CAN_BST) >= 0, 1);
+    expect_eq("full hold no bro", find_can(&tx, CHG_CAN_BRO) < 0, 1);
+    expect_eq("full hold no bcl", find_can(&tx, CHG_CAN_BCL) < 0, 1);
+
+    bms_link_can_rx(&link, &rx);
+    for (i = 0; i < 5; i++) {
+        bms_link_tick(&link, &c, 10, &tx);
+        expect_eq("full hold stays stop", tx.phase, CHG_PHASE_STOP);
+        expect_eq("full hold still no bro", find_can(&tx, CHG_CAN_BRO) < 0, 1);
+        expect_eq("full hold still no bcl", find_can(&tx, CHG_CAN_BCL) < 0, 1);
+    }
+
+    c = energy();
+    bms_link_tick(&link, &c, 250, &tx);
+    bcl = find_can(&tx, CHG_CAN_BCL);
+    bro = find_can(&tx, CHG_CAN_BRO);
+    expect_eq("full release first is hs", tx.phase, CHG_PHASE_HS);
+    expect_eq("full release has bcl", bcl >= 0, 1);
+    expect_eq("full release has bro", bro >= 0, 1);
+    if (bcl >= 0 && bro >= 0) {
+        expect_eq("full release current 0", tx.can[bcl].data[2], 0xA0);
+        expect_eq("full release bro 00", tx.can[bro].data[0], 0x00);
+    }
+
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 250, &tx);
+    bcl = find_can(&tx, CHG_CAN_BCL);
+    bro = find_can(&tx, CHG_CAN_BRO);
+    expect_eq("full release then run", tx.phase, CHG_PHASE_RUN);
+    expect_eq("full release run bcl", bcl >= 0, 1);
+    expect_eq("full release run bro", bro >= 0, 1);
+    if (bcl >= 0 && bro >= 0) {
+        expect_mem("full release run current", tx.can[bcl].data,
+                   (const uint8_t *)"\x48\x03\x30\x11\x02", 5);
+        expect_eq("full release run bro aa", tx.can[bro].data[0], 0xAA);
+    }
+}
+
 int main(void)
 {
     test_sif();
@@ -1314,6 +1380,7 @@ int main(void)
     test_bsm_flags();
     test_bms_null_guards();
     test_raw_guards();
+    test_full_stop_rehandshake();
     if (g_fail) {
         return 1;
     }
