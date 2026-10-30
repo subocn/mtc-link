@@ -1636,6 +1636,91 @@ static void test_defined_values(void)
     expect_eq("seq4 drop", link.rx_drop, drops + 1u);
 }
 
+/* BST 之后连续多拍只送带电流的 BCL 和 BRO 为 AA。功率级保持断开，CRO 保持 00。
+ * 先发 BRO 为 00，再发 BRO 为 AA，才进入能量传输。 */
+static void test_bst_bare_aa_holds(void)
+{
+    ChrLink link;
+    ChrTx tx;
+    ChgCap cap = limits();
+    ChgStat st = meas();
+    ChgCan f;
+    int i;
+    int cro_n;
+
+    chr_link_init(&link, CHG_PORT_CAN, &cap);
+    chr_link_tick(&link, &st, 0, &tx);
+    memset(&f, 0, sizeof f);
+    f.id = CHG_CAN_BRO;
+    f.dlc = 1;
+    f.data[0] = 0x00;
+    chr_link_can_rx(&link, &f, &st, &tx);
+    f.id = CHG_CAN_BCL;
+    f.dlc = 5;
+    memcpy(f.data, "\x48\x03\x30\x11\x02", 5);
+    chr_link_can_rx(&link, &f, &st, &tx);
+    f.id = CHG_CAN_BRO;
+    f.dlc = 1;
+    f.data[0] = 0xAA;
+    chr_link_can_rx(&link, &f, &st, &tx);
+    expect_eq("bare aa setup run", tx.phase, CHG_PHASE_RUN);
+    expect_eq("bare aa setup enable", tx.act.enable, 1);
+
+    f.id = CHG_CAN_BST;
+    f.dlc = 4;
+    memset(f.data, 0, sizeof f.data);
+    f.data[0] = 0x01;
+    chr_link_can_rx(&link, &f, &st, &tx);
+    expect_eq("bare aa bst stop", tx.phase, CHG_PHASE_STOP);
+    expect_eq("bare aa bst enable", tx.act.enable, 0);
+
+    cro_n = 0;
+    for (i = 0; i < 40; i++) {
+        int cro;
+        chr_link_tick(&link, &st, 50, &tx);
+        expect_eq("bare aa tick hs", tx.phase, CHG_PHASE_HS);
+        expect_eq("bare aa tick off", tx.act.enable, 0);
+        cro = find_can(&tx, CHG_CAN_CRO);
+        if (cro >= 0) {
+            cro_n++;
+            expect_eq("bare aa cro 00", tx.can[cro].data[0], 0x00);
+        }
+        f.id = CHG_CAN_BCL;
+        f.dlc = 5;
+        memcpy(f.data, "\x48\x03\x30\x11\x02", 5);
+        chr_link_can_rx(&link, &f, &st, &tx);
+        expect_eq("bare aa bcl hs", tx.phase, CHG_PHASE_HS);
+        expect_eq("bare aa bcl off", tx.act.enable, 0);
+        expect_eq("bare aa bcl seen0", link.seen_allow0, 0);
+        f.id = CHG_CAN_BRO;
+        f.dlc = 1;
+        f.data[0] = 0xAA;
+        chr_link_can_rx(&link, &f, &st, &tx);
+        expect_eq("bare aa bro hs", tx.phase, CHG_PHASE_HS);
+        expect_eq("bare aa bro off", tx.act.enable, 0);
+        expect_eq("bare aa bro seen0", link.seen_allow0, 0);
+    }
+    expect_eq("bare aa saw cro", cro_n > 0, 1);
+
+    f.id = CHG_CAN_BRO;
+    f.dlc = 1;
+    f.data[0] = 0x00;
+    chr_link_can_rx(&link, &f, &st, &tx);
+    expect_eq("bare aa legal 00", tx.phase, CHG_PHASE_HS);
+    expect_eq("bare aa legal seen0", link.seen_allow0, 1);
+    expect_eq("bare aa legal off", tx.act.enable, 0);
+    f.id = CHG_CAN_BCL;
+    f.dlc = 5;
+    memcpy(f.data, "\x48\x03\x30\x11\x02", 5);
+    chr_link_can_rx(&link, &f, &st, &tx);
+    f.id = CHG_CAN_BRO;
+    f.dlc = 1;
+    f.data[0] = 0xAA;
+    chr_link_can_rx(&link, &f, &st, &tx);
+    expect_eq("bare aa legal run", tx.phase, CHG_PHASE_RUN);
+    expect_eq("bare aa legal enable", tx.act.enable, 1);
+}
+
 int main(void)
 {
     test_apply();
@@ -1658,6 +1743,7 @@ int main(void)
     test_period_and_address();
     test_defined_values();
     test_loss_source();
+    test_bst_bare_aa_holds();
     if (g_fail) {
         return 1;
     }
