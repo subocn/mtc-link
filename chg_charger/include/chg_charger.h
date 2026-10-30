@@ -122,12 +122,14 @@ typedef struct {
 /* 交流进线允许电流，0.1 A。kind 只接受国标交流或欧标交流，否则返回 0。
  * cp_nominal_mv 不是 6000 时返回 0。duty_permille 里 533 表示 53.3%。
  * ohm 只认 1500、680、220、100，其他返回 0。100 Ω 单相返回 32.0 A，不取 63 A。
- * 高于 85% 至 97% 的标准高档（含 80 A）本链路不取。
+ * 高于 85% 至 96% 按 (百分数 − 64) × 2.5 A，四舍五入到 0.1 A，不得改用 ×0.6。
+ * 高于 96% 至 97% 为 80.0 A。这两档再与电缆档和额定取较小者，单相不得超过 32.0 A。
  * rated_inlet_01a 为调用方给出的进线额定，0 表示未知，返回 0。
- * digital_valid 为 1 时再与 digital_01a 取较小者；digital_01a 为 0 则结果为 0。
- * digital_valid 为 0 时不另造数字限流。模拟电流为 0 时直接返回 0，
- * 数字限流不把 3% 至 7%、高于 7% 且低于 8%、高于 85% 改成可取电。
- * 不改写已保存的 0x01。 */
+ * 低于 3%、高于 7% 且低于 8%、高于 97% 为 0，数字电流也不放开。
+ * 3% 至 7% 没有模拟电流。digital_valid 为 0，或 digital_01a 为 0，则结果为 0。
+ * digital_valid 为 1 且数字电流非 0 时，取数字电流、电缆档与额定的较小者。
+ * 8% 至 97% 已有模拟电流时，digital_valid 为 1 再取较小者；数字电流为 0 则结果为 0。
+ * digital_valid 为 0 时不另造数字限流。不改写已保存的 0x01。 */
 uint16_t chg_ac_inlet_01a(uint8_t kind, uint16_t cp_nominal_mv, uint16_t duty_permille,
                           uint16_t ohm, uint16_t rated_inlet_01a, uint8_t digital_valid,
                           uint16_t digital_01a);
@@ -143,16 +145,19 @@ uint16_t chg_ac_batt_01a(uint16_t i_req_01a, uint16_t v_batt_01v, uint16_t v_ac_
                          uint16_t v_ac_max_01v);
 
 /* 直流桩目标。国标直流与欧标直流量值用同一函数。out 为空则直接返回。
- * 本机输入窗口、桩输出电压范围、桩电流范围，任一端为 0 或下限高于上限，则 send 为 0。
- * eff_permille 为 0 或大于 1000 则 send 为 0。两个窗口没有交集则 send 为 0。
+ * 本机输入窗口或桩输出电压范围任一端为 0，或下限高于上限，则 send 为 0。
+ * 桩电流上限为 0 表示没收到能力，send 为 0。电流下限为 0 表示桩没有下限。
+ * 电流下限高于上限则 send 为 0。eff_permille 为 0 或大于 1000 则 send 为 0。
+ * 两个窗口没有交集则 send 为 0。
  * 进线落在交集内用进线。进线在本机窗口内但高于交集上限时，向下取交集上限。
  * 进线在本机窗口内但低于交集下限时，取交集下限。进线在本机窗口外则 send 为 0，
  * 不得把窗口外的电压抬进窗口。没有实测时，上一次目标仍在交集内则用上一次，否则用交集下限。
  * 电流按电池侧功率除以目标电压向上取整，再与桩最大电流取较小者。
  * 小于桩最小电流时 send 为 0，不发一帧会让桩按最小能力续出的需求。
+ * 下限为 0 时，这一条不拒绝正电流。
  * 暂停时电压保持上一次仍在交集内的值，不改成电池口电压，也不改成 0。
  * 暂停电流高于桩最大电流时只向下钳；低于桩最小电流，或上一次电压不在交集内，则 send 为 0。
- * 目标电压不取电池口请求电压。 */
+ * 目标电压不取电池口请求电压。电池口是否按本结果下调，由 chg_dc_batt_01a 另算。 */
 void chg_dc_pile_demand(uint8_t kind, uint16_t v_win_lo_01v, uint16_t v_win_hi_01v,
                         uint16_t v_inlet_01v, uint16_t v_batt_01v, uint16_t i_batt_01a,
                         uint16_t eff_permille, uint16_t v_pile_min_01v, uint16_t v_pile_max_01v,
@@ -169,6 +174,20 @@ uint8_t chg_gb_dc_i_raw(uint16_t i_01a, uint16_t *raw);
  * 原始值大于 4000 时失败，且不写出。不得把本链路 BCL 的 4400 当成 40.0 A 充电。
  * 恰好 4000 得到 0 A。恰好 0 得到 400.0 A。i_01a 为空时返回 0。欧标 EXI 不用。 */
 uint8_t chg_gb_dc_i_phys(uint16_t raw, uint16_t *i_01a);
+
+/* 直流电池侧只下调，0.1 A。i_pile_01a 必须是 chg_dc_pile_demand 已经与桩最大取过小的电流。
+ * 传入钳位前的计算值会让电池口按桩给不出的功率出流。
+ * 上限向下取整，结果不超过 i_req_01a，不得抬高。
+ * 请求、电池电压、桩电压、桩电流为 0，或效率为 0、大于 1000，返回 0。
+ * 结果为 0 时电池口不出流，桩侧也不要发该需求，改发停止。暂停时请求已是 0，本函数返回 0。 */
+uint16_t chg_dc_batt_01a(uint16_t i_req_01a, uint16_t v_batt_01v, uint16_t v_pile_01v,
+                         uint16_t i_pile_01a, uint16_t eff_permille);
+
+/* 国标直流 CML 的最大、最小充电电流。两只原始值都按 chg_gb_dc_i_phys 解码，再按幅值排序。
+ * 较大的写入 i_max，较小的写入 i_min。字段标签写反仍得到同一区间。
+ * 任一原始值大于 4000，或指针为空，失败且不写出。排序后的最大为 0 时失败。
+ * 最小解出 0 表示没有下限。欧标 EXI 不用。 */
+uint8_t chg_gb_dc_cml_i(uint16_t raw_max, uint16_t raw_min, uint16_t *i_min, uint16_t *i_max);
 
 /* cap 是本机输出能力。一线通把书面限值放在这里。就绪位由会话改写。
  * 初始化后为 OFF。第一次 tick 进入握手。 */

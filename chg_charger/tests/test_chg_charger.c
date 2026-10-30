@@ -1754,24 +1754,43 @@ static void test_ac_inlet(void)
     expect_eq("duty 70", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 70, 220, 400), 0);
     expect_eq("duty 71", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 71, 220, 400), 0);
     expect_eq("duty 79", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 79, 220, 400), 0);
-    expect_eq("duty 851", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 851, 220, 800), 0);
-    expect_eq("duty 960", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 960, 220, 800), 0);
-    expect_eq("duty 961", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 961, 220, 800), 0);
-    expect_eq("duty 965", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 965, 220, 800), 0);
-    expect_eq("duty 970", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 970, 220, 800), 0);
+    /* 85.1% 起标准高档已高于 51 A。单相 220 Ω 把结果帽在 32.0 A，不得取 0，也不得输出 80 A。 */
+    expect_eq("duty 851", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 851, 220, 800), 320);
+    expect_eq("duty 960", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 960, 220, 800), 320);
+    expect_eq("duty 961", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 961, 220, 800), 320);
+    expect_eq("duty 965", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 965, 220, 800), 320);
+    expect_eq("duty 970", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 970, 220, 800), 320);
+    expect_eq("duty 971", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 971, 220, 800), 0);
     expect_eq("duty 1000", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 1000, 220, 800), 0);
+    expect_eq("duty 900 cable", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 900, 220, 800), 320);
+    expect_eq("duty 851 rated", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 851, 220, 100), 100);
+    expect_eq("duty 851 gb 1k5", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 851, 1500, 800), 100);
+    expect_eq("duty 900 eu 680", ac_nom(CHG_PILE_EU_AC, CHG_CP_READY_MV, 900, 680, 800), 200);
     expect_eq("digital lower", chg_ac_inlet_01a(CHG_PILE_GB_AC, CHG_CP_READY_MV, 533, 220, 400, 1, 100),
               100);
     expect_eq("digital zero", chg_ac_inlet_01a(CHG_PILE_GB_AC, CHG_CP_READY_MV, 533, 220, 400, 1, 0), 0);
     expect_eq("digital no raise", chg_ac_inlet_01a(CHG_PILE_EU_AC, CHG_CP_READY_MV, 533, 220, 800, 1, 800),
               320);
-    /* 3%–7% 没有模拟电流。数字限流只下调已有的模拟电流，不把这一档变成可取电。 */
+    /* 3%–7% 没有模拟电流。调用方给出数字电流时取数字、电缆与额定的较小者。 */
     expect_eq("duty 5 digital", chg_ac_inlet_01a(CHG_PILE_EU_AC, CHG_CP_READY_MV, 50, 220, 400, 1, 160),
+              160);
+    expect_eq("duty 5 no digital", ac_nom(CHG_PILE_EU_AC, CHG_CP_READY_MV, 50, 220, 400), 0);
+    expect_eq("duty 5 cap", chg_ac_inlet_01a(CHG_PILE_EU_AC, CHG_CP_READY_MV, 50, 220, 400, 1, 800),
+              320);
+    expect_eq("duty 30 digital", chg_ac_inlet_01a(CHG_PILE_GB_AC, CHG_CP_READY_MV, 30, 220, 400, 1, 160),
+              160);
+    expect_eq("duty 70 digital", chg_ac_inlet_01a(CHG_PILE_GB_AC, CHG_CP_READY_MV, 70, 220, 400, 1, 160),
+              160);
+    expect_eq("duty 20 digital", chg_ac_inlet_01a(CHG_PILE_GB_AC, CHG_CP_READY_MV, 20, 220, 400, 1, 160),
               0);
     expect_eq("duty gap digital", chg_ac_inlet_01a(CHG_PILE_GB_AC, CHG_CP_READY_MV, 75, 220, 400, 1, 160),
               0);
-    expect_eq("duty high digital", chg_ac_inlet_01a(CHG_PILE_GB_AC, CHG_CP_READY_MV, 900, 220, 800, 1, 160),
+    expect_eq("duty 971 digital", chg_ac_inlet_01a(CHG_PILE_GB_AC, CHG_CP_READY_MV, 971, 220, 800, 1, 160),
               0);
+    expect_eq("duty high digital", chg_ac_inlet_01a(CHG_PILE_GB_AC, CHG_CP_READY_MV, 900, 220, 800, 1, 160),
+              160);
+    expect_eq("duty 900 digital cap",
+              chg_ac_inlet_01a(CHG_PILE_GB_AC, CHG_CP_READY_MV, 900, 220, 800, 1, 800), 320);
     expect_eq("rated 0", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 533, 220, 0), 0);
     expect_eq("rated clamps", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 533, 220, 100), 100);
     expect_eq("ohm off", ac_nom(CHG_PILE_GB_AC, CHG_CP_READY_MV, 533, 681, 400), 0);
@@ -1816,6 +1835,8 @@ static void test_dc_pile(void)
 {
     ChgPileDemand d;
     uint16_t raw;
+    uint16_t lo;
+    uint16_t hi;
     uint8_t ok;
 
     dem(CHG_PILE_GB_DC, 4000, 840, 400, 900, 0, 0, 0, &d);
@@ -1882,7 +1903,19 @@ static void test_dc_pile(void)
     chg_dc_pile_demand(CHG_PILE_GB_DC, 3300, 4500, 4000, 840, 400, 900, 0, 7500, 10, 2500, 0, 0, 0, &d);
     expect_eq("no pile v", d.send, 0);
     chg_dc_pile_demand(CHG_PILE_GB_DC, 3300, 4500, 4000, 840, 400, 900, 2000, 7500, 0, 2500, 0, 0, 0, &d);
-    expect_eq("no pile i", d.send, 0);
+    expect_eq("pile i min 0", d.send, 1);
+    expect_eq("pile i min 0 v", d.v_01v, 4000);
+    expect_eq("pile i min 0 i", d.i_01a, 94);
+    chg_dc_pile_demand(CHG_PILE_GB_DC, 3300, 4500, 4000, 840, 400, 900, 2000, 7500, 0, 0, 0, 0, 0, &d);
+    expect_eq("pile i max 0", d.send, 0);
+    chg_dc_pile_demand(CHG_PILE_GB_DC, 3300, 4500, 4000, 840, 400, 900, 2000, 7500, 10, 0, 0, 0, 0, &d);
+    expect_eq("pile i max missing", d.send, 0);
+    chg_dc_pile_demand(CHG_PILE_GB_DC, 3300, 4500, 4000, 840, 400, 900, 2000, 7500, 0, 50, 0, 0, 0, &d);
+    expect_eq("pile i min 0 clamp", d.send, 1);
+    expect_eq("pile i min 0 clamp i", d.i_01a, 50);
+    chg_dc_pile_demand(CHG_PILE_GB_DC, 3300, 4500, 0, 840, 0, 0, 2000, 7500, 0, 2500, 1, 4000, 94, &d);
+    expect_eq("pause i min 0", d.send, 1);
+    expect_eq("pause i min 0 i", d.i_01a, 94);
 
     dem(CHG_PILE_GB_DC, 0, 840, 400, 900, 0, 4000, 0, &d);
     expect_eq("no meas prev", d.send, 1);
@@ -1952,6 +1985,51 @@ static void test_dc_pile(void)
     expect_eq("phys link raw", ok, 0);
     expect_eq("phys link kept", raw, 0xFFFFu);
     expect_eq("phys null", chg_gb_dc_i_phys(3600, 0), 0);
+
+    /* 9.4 A、400.0 V、90%、84.0 V 向下取整为 40.2 A，再与请求 40.0 A 取小，不得抬高。 */
+    expect_eq("dc batt no raise", chg_dc_batt_01a(400, 840, 4000, 94, 900), 400);
+    /* 桩最大只有 5.0 A：400 V × 5 A × 0.9 / 84 V = 21.428 A，向下取整为 21.4 A。 */
+    expect_eq("dc batt clamp", chg_dc_batt_01a(400, 840, 4000, 50, 900), 214);
+    expect_eq("dc batt exact", chg_dc_batt_01a(400, 840, 4000, 84, 1000), 400);
+    expect_eq("dc batt req 0", chg_dc_batt_01a(0, 840, 4000, 94, 900), 0);
+    expect_eq("dc batt vbatt 0", chg_dc_batt_01a(400, 0, 4000, 94, 900), 0);
+    expect_eq("dc batt vpile 0", chg_dc_batt_01a(400, 840, 0, 94, 900), 0);
+    expect_eq("dc batt ipile 0", chg_dc_batt_01a(400, 840, 4000, 0, 900), 0);
+    expect_eq("dc batt eff 0", chg_dc_batt_01a(400, 840, 4000, 94, 0), 0);
+    expect_eq("dc batt eff over", chg_dc_batt_01a(400, 840, 4000, 94, 1001), 0);
+
+    lo = 0xFFFFu;
+    hi = 0xFFFFu;
+    ok = chg_gb_dc_cml_i(1500, 3900, &lo, &hi);
+    expect_eq("cml ok", ok, 1);
+    expect_eq("cml min", lo, 100);
+    expect_eq("cml max", hi, 2500);
+    ok = chg_gb_dc_cml_i(3900, 1500, &lo, &hi);
+    expect_eq("cml swapped min", lo, 100);
+    expect_eq("cml swapped max", hi, 2500);
+    lo = 7u;
+    hi = 9u;
+    ok = chg_gb_dc_cml_i(4400, 1500, &lo, &hi);
+    expect_eq("cml link raw", ok, 0);
+    expect_eq("cml link lo", lo, 7);
+    expect_eq("cml link hi", hi, 9);
+    ok = chg_gb_dc_cml_i(4000, 4000, &lo, &hi);
+    expect_eq("cml both zero", ok, 0);
+    expect_eq("cml both zero lo", lo, 7);
+    ok = chg_gb_dc_cml_i(3600, 4000, &lo, &hi);
+    expect_eq("cml min raw zero", ok, 1);
+    expect_eq("cml min raw zero lo", lo, 0);
+    expect_eq("cml min raw zero hi", hi, 400);
+    ok = chg_gb_dc_cml_i(4000, 3600, &lo, &hi);
+    expect_eq("cml max raw zero", ok, 1);
+    expect_eq("cml max raw zero lo", lo, 0);
+    expect_eq("cml max raw zero hi", hi, 400);
+    ok = chg_gb_dc_cml_i(3600, 3600, &lo, &hi);
+    expect_eq("cml equal", ok, 1);
+    expect_eq("cml equal lo", lo, 400);
+    expect_eq("cml equal hi", hi, 400);
+    expect_eq("cml null min", chg_gb_dc_cml_i(1500, 3900, 0, &hi), 0);
+    expect_eq("cml null max", chg_gb_dc_cml_i(1500, 3900, &lo, 0), 0);
     chg_dc_pile_demand(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 

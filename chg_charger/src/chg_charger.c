@@ -336,23 +336,48 @@ static int div_ceil_u16(uint64_t n, uint64_t d, uint16_t *out)
     return 1;
 }
 
-/* 本链路交流口：8% 至不足 10% 为 6 A；10% 至 85% 为百分数 × 0.6 A。
- * 低于 8%、高于 85% 都不取电。高于 85% 至 96% 的标准高档不改用 ×0.6。 */
-static uint16_t ac_duty_01a(uint16_t duty_permille)
+/* 占空比千分比。533 表示 53.3%。模拟电流为 0 的两档要分开：
+ * 3% 至 7% 只在调用方给出数字电流时取电；低于 3%、7%–8% 间隙、高于 97% 即使有数字电流也不取。 */
+#define AC_DUTY_ZERO 0
+#define AC_DUTY_DIGITAL 1
+#define AC_DUTY_ANALOG 2
+
+/* 8% 至不足 10% 为 6.0 A。10% 至 85% 为百分数 × 0.6 A，四舍五入到 0.1 A。
+ * 高于 85% 至 96% 为 (百分数 − 64) × 2.5 A，四舍五入到 0.1 A，不得改用 ×0.6。
+ * 高于 96% 至 97% 为 80.0 A。单相电缆档再把结果帽到不超过 32.0 A。 */
+static int ac_duty_class(uint16_t duty_permille, uint16_t *analog)
 {
     uint32_t n;
 
-    if (duty_permille < 80u || duty_permille > 850u) {
-        return 0u;
+    if (analog == 0) {
+        return AC_DUTY_ZERO;
+    }
+    *analog = 0u;
+    if (duty_permille < 30u || duty_permille > 970u) {
+        return AC_DUTY_ZERO;
+    }
+    if (duty_permille <= 70u) {
+        return AC_DUTY_DIGITAL;
+    }
+    if (duty_permille < 80u) {
+        return AC_DUTY_ZERO;
     }
     if (duty_permille < 100u) {
-        return 60u;
+        *analog = 60u;
+        return AC_DUTY_ANALOG;
     }
-    n = ((uint32_t)duty_permille * 6u + 5u) / 10u;
-    if (n > 65535u) {
-        return 65535u;
+    if (duty_permille <= 850u) {
+        n = ((uint32_t)duty_permille * 6u + 5u) / 10u;
+    } else if (duty_permille <= 960u) {
+        n = (((uint32_t)duty_permille - 640u) * 5u + 1u) / 2u;
+    } else {
+        n = 800u;
     }
-    return (uint16_t)n;
+    if (n == 0u || n > 65535u) {
+        return AC_DUTY_ZERO;
+    }
+    *analog = (uint16_t)n;
+    return AC_DUTY_ANALOG;
 }
 
 /* 国标 CC 与 Type 2 PP 的 1.5 kΩ、680 Ω 电流不同。100 Ω 单相帽在 32.0 A。 */
@@ -394,6 +419,7 @@ uint16_t chg_ac_inlet_01a(uint8_t kind, uint16_t cp_nominal_mv, uint16_t duty_pe
     uint16_t duty_i;
     uint16_t cable_i;
     uint16_t i;
+    int cls;
 
     if (kind != CHG_PILE_GB_AC && kind != CHG_PILE_EU_AC) {
         return 0u;
@@ -401,9 +427,21 @@ uint16_t chg_ac_inlet_01a(uint8_t kind, uint16_t cp_nominal_mv, uint16_t duty_pe
     if (cp_nominal_mv != CHG_CP_READY_MV || rated_inlet_01a == 0u) {
         return 0u;
     }
-    duty_i = ac_duty_01a(duty_permille);
     cable_i = ac_cable_01a(kind, ohm);
-    if (duty_i == 0u || cable_i == 0u) {
+    if (cable_i == 0u) {
+        return 0u;
+    }
+    cls = ac_duty_class(duty_permille, &duty_i);
+    if (cls == AC_DUTY_ZERO) {
+        return 0u;
+    }
+    if (cls == AC_DUTY_DIGITAL) {
+        if (digital_valid == 0u || digital_01a == 0u) {
+            return 0u;
+        }
+        return u16_min(digital_01a, u16_min(cable_i, rated_inlet_01a));
+    }
+    if (duty_i == 0u) {
         return 0u;
     }
     i = u16_min(duty_i, u16_min(cable_i, rated_inlet_01a));
@@ -471,7 +509,8 @@ static int pile_limits_ok(uint16_t v_lo, uint16_t v_hi, uint16_t i_lo, uint16_t 
     if (v_lo == 0u || v_hi == 0u || v_lo > v_hi) {
         return 0;
     }
-    if (i_lo == 0u || i_hi == 0u || i_lo > i_hi) {
+    /* 电流下限 0 是真实的「没有下限」。上限 0 仍表示没收到能力。 */
+    if (i_hi == 0u || i_lo > i_hi) {
         return 0;
     }
     return 1;
@@ -568,6 +607,52 @@ uint8_t chg_gb_dc_i_phys(uint16_t raw, uint16_t *i_01a)
         return 0u;
     }
     *i_01a = (uint16_t)(4000u - raw);
+    return 1u;
+}
+
+uint16_t chg_dc_batt_01a(uint16_t i_req_01a, uint16_t v_batt_01v, uint16_t v_pile_01v,
+                         uint16_t i_pile_01a, uint16_t eff_permille)
+{
+    uint16_t i_max;
+
+    if (i_req_01a == 0u || v_batt_01v == 0u || v_pile_01v == 0u || i_pile_01a == 0u ||
+        eff_permille == 0u || eff_permille > 1000u) {
+        return 0u;
+    }
+    /* 传入的桩电流必须已经与桩最大取过小。向下取整，再不得超过请求。 */
+    if (!div_floor_u16((uint64_t)i_pile_01a * v_pile_01v * eff_permille,
+                       (uint64_t)v_batt_01v * 1000u, &i_max)) {
+        return 0u;
+    }
+    return u16_min(i_max, i_req_01a);
+}
+
+uint8_t chg_gb_dc_cml_i(uint16_t raw_max, uint16_t raw_min, uint16_t *i_min, uint16_t *i_max)
+{
+    uint16_t a;
+    uint16_t b;
+    uint16_t lo;
+    uint16_t hi;
+
+    if (i_min == 0 || i_max == 0) {
+        return 0u;
+    }
+    if (chg_gb_dc_i_phys(raw_max, &a) == 0u || chg_gb_dc_i_phys(raw_min, &b) == 0u) {
+        return 0u;
+    }
+    if (a >= b) {
+        hi = a;
+        lo = b;
+    } else {
+        hi = b;
+        lo = a;
+    }
+    /* 最大侧为 0 表示两只都不是充电能力。最小侧为 0 是没有下限，可以写出。 */
+    if (hi == 0u) {
+        return 0u;
+    }
+    *i_min = lo;
+    *i_max = hi;
     return 1u;
 }
 
