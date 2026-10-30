@@ -2053,11 +2053,15 @@ static void test_pile_restart(void)
     expect_restart("pause eu", CHG_PILE_EU_DC, CHG_PILE_END_PAUSE, CHG_PLUG_HELD, 0, 0, 0);
 
     expect_restart("ac held", CHG_PILE_GB_AC, CHG_PILE_END_NORMAL, CHG_PLUG_HELD, 0, 1, 1);
+    expect_restart("gb ac open", CHG_PILE_GB_AC, CHG_PILE_END_NORMAL, CHG_PLUG_OPEN, 0, 1, 0);
     expect_restart("eu ac open", CHG_PILE_EU_AC, CHG_PILE_END_NORMAL, CHG_PLUG_OPEN, 0, 1, 0);
     expect_restart("ac reseat", CHG_PILE_EU_AC, CHG_PILE_END_NORMAL, CHG_PLUG_RESEATED, 0, 1, 1);
     expect_restart("gb dc held", CHG_PILE_GB_DC, CHG_PILE_END_NORMAL, CHG_PLUG_HELD, 0, 1, 1);
     expect_restart("eu dc held", CHG_PILE_EU_DC, CHG_PILE_END_NORMAL, CHG_PLUG_HELD, 0, 1, 1);
+    expect_restart("eu dc open", CHG_PILE_EU_DC, CHG_PILE_END_NORMAL, CHG_PLUG_OPEN, 0, 1, 0);
     expect_restart("dc open", CHG_PILE_GB_DC, CHG_PILE_END_NORMAL, CHG_PLUG_OPEN, 0, 1, 0);
+    expect_restart("cro timeout held", CHG_PILE_GB_DC, CHG_PILE_END_NORMAL, CHG_PLUG_HELD, 0, 1, 1);
+    expect_restart("pause timeout open", CHG_PILE_GB_DC, CHG_PILE_END_NORMAL, CHG_PLUG_OPEN, 0, 1, 0);
 
     expect_restart("replug held", CHG_PILE_GB_DC, CHG_PILE_END_REPLUG, CHG_PLUG_HELD, 0, 1, 0);
     expect_restart("replug open", CHG_PILE_GB_DC, CHG_PILE_END_REPLUG, CHG_PLUG_OPEN, 0, 1, 0);
