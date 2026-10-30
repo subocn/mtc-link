@@ -656,6 +656,48 @@ uint8_t chg_gb_dc_cml_i(uint16_t raw_max, uint16_t raw_min, uint16_t *i_min, uin
     return 1u;
 }
 
+static uint8_t pile_kind_ok(uint8_t kind)
+{
+    return kind == CHG_PILE_GB_AC || kind == CHG_PILE_EU_AC ||
+           kind == CHG_PILE_GB_DC || kind == CHG_PILE_EU_DC;
+}
+
+void chg_pile_restart(uint8_t kind, uint8_t reason, uint8_t plug,
+                      uint8_t retries_left, ChgPileRestart *out)
+{
+    if (out == 0) {
+        return;
+    }
+    out->cut = 1u;
+    out->restart = 0u;
+    if (!pile_kind_ok(kind)) {
+        return;
+    }
+    if (plug != CHG_PLUG_HELD && plug != CHG_PLUG_OPEN && plug != CHG_PLUG_RESEATED) {
+        return;
+    }
+    if (reason == CHG_PILE_END_PAUSE) {
+        out->cut = 0u;
+        return;
+    }
+    if (reason == CHG_PILE_END_NORMAL) {
+        out->restart = (plug == CHG_PLUG_OPEN) ? 0u : 1u;
+        return;
+    }
+    if (reason == CHG_PILE_END_REPLUG) {
+        out->restart = (plug == CHG_PLUG_RESEATED) ? 1u : 0u;
+        return;
+    }
+    if (reason == CHG_PILE_END_RETRY) {
+        if (kind != CHG_PILE_GB_DC || plug == CHG_PLUG_OPEN) {
+            return;
+        }
+        if (retries_left > 0u || plug == CHG_PLUG_RESEATED) {
+            out->restart = 1u;
+        }
+    }
+}
+
 /* 无新鲜合法 0x04 时返回 1，家充仍按 0x01。允许电流不参与。 */
 static int bat_compatible(const ChrLink *l)
 {
