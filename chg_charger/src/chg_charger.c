@@ -306,6 +306,168 @@ void chg_apply(const ChgCtrl *ctrl, const ChgCap *cap, uint8_t cap_valid, uint8_
     act->enable = 1;
 }
 
+static uint16_t div_round_half_up(uint64_t n, uint64_t d)
+{
+    if (d == 0u) {
+        return 0u;
+    }
+    n = (n + d / 2u) / d;
+    if (n > 65535u) {
+        return 65535u;
+    }
+    return (uint16_t)n;
+}
+
+/* 本链路交流口：8% 至不足 10% 为 6 A；10% 至 85% 为百分数 × 0.6 A。
+ * 低于 8%、高于 85% 都不取电。高于 85% 至 96% 的标准高档不改用 ×0.6。 */
+static uint16_t ac_duty_01a(uint16_t duty_permille)
+{
+    uint32_t n;
+
+    if (duty_permille < 80u || duty_permille > 850u) {
+        return 0u;
+    }
+    if (duty_permille < 100u) {
+        return 60u;
+    }
+    n = ((uint32_t)duty_permille * 6u + 5u) / 10u;
+    if (n > 65535u) {
+        return 65535u;
+    }
+    return (uint16_t)n;
+}
+
+/* 国标 CC 与 Type 2 PP 的 1.5 kΩ、680 Ω 电流不同。100 Ω 单相帽在 32.0 A。 */
+static uint16_t ac_cable_01a(uint8_t kind, uint16_t ohm)
+{
+    if (kind == CHG_PILE_GB_AC) {
+        if (ohm == 1500u) {
+            return 100u;
+        }
+        if (ohm == 680u) {
+            return 160u;
+        }
+        if (ohm == 220u || ohm == 100u) {
+            return 320u;
+        }
+    } else if (kind == CHG_PILE_EU_AC) {
+        if (ohm == 1500u) {
+            return 130u;
+        }
+        if (ohm == 680u) {
+            return 200u;
+        }
+        if (ohm == 220u || ohm == 100u) {
+            return 320u;
+        }
+    }
+    return 0u;
+}
+
+static uint16_t u16_min(uint16_t a, uint16_t b)
+{
+    return a < b ? a : b;
+}
+
+uint16_t chg_ac_inlet_01a(uint8_t kind, uint16_t cp_nominal_mv, uint16_t duty_permille,
+                          uint16_t ohm, uint16_t rated_inlet_01a)
+{
+    uint16_t duty_i;
+    uint16_t cable_i;
+
+    if (kind != CHG_PILE_GB_AC && kind != CHG_PILE_EU_AC) {
+        return 0u;
+    }
+    if (cp_nominal_mv != CHG_CP_READY_MV || rated_inlet_01a == 0u) {
+        return 0u;
+    }
+    duty_i = ac_duty_01a(duty_permille);
+    cable_i = ac_cable_01a(kind, ohm);
+    if (duty_i == 0u || cable_i == 0u) {
+        return 0u;
+    }
+    return u16_min(duty_i, u16_min(cable_i, rated_inlet_01a));
+}
+
+uint16_t chg_ac_batt_01a(uint16_t i_req_01a, uint16_t v_batt_01v, uint16_t v_ac_01v,
+                         uint16_t i_inlet_01a, uint16_t eff_permille)
+{
+    uint16_t i_max;
+
+    if (i_req_01a == 0u || v_batt_01v == 0u || v_ac_01v == 0u || i_inlet_01a == 0u ||
+        eff_permille == 0u) {
+        return 0u;
+    }
+    /* i_max = 进线电流 × 进线电压 × 效率 / 电池电压。效率是千分比。 */
+    i_max = div_round_half_up((uint64_t)i_inlet_01a * v_ac_01v * eff_permille,
+                              (uint64_t)v_batt_01v * 1000u);
+    return u16_min(i_max, i_req_01a);
+}
+
+static int in_window(uint16_t v, uint16_t lo, uint16_t hi)
+{
+    return v >= lo && v <= hi;
+}
+
+static void demand_clear(ChgPileDemand *out)
+{
+    out->send = 0u;
+    out->v_01v = 0u;
+    out->i_01a = 0u;
+}
+
+void chg_dc_pile_demand(uint8_t kind, uint16_t v_win_lo_01v, uint16_t v_win_hi_01v,
+                        uint16_t v_inlet_01v, uint16_t v_batt_01v, uint16_t i_batt_01a,
+                        uint16_t eff_permille, uint16_t i_pile_max_01a, uint8_t pause,
+                        uint16_t v_prev_01v, uint16_t i_prev_01a, ChgPileDemand *out)
+{
+    uint16_t v;
+    uint16_t i;
+
+    if (out == 0) {
+        return;
+    }
+    demand_clear(out);
+    if (kind != CHG_PILE_GB_DC && kind != CHG_PILE_EU_DC) {
+        return;
+    }
+    if (v_win_lo_01v == 0u || v_win_hi_01v == 0u || v_win_lo_01v > v_win_hi_01v) {
+        return;
+    }
+    if (pause != 0u && i_prev_01a != 0u && in_window(v_prev_01v, v_win_lo_01v, v_win_hi_01v)) {
+        out->send = 1u;
+        out->v_01v = v_prev_01v;
+        out->i_01a = i_prev_01a;
+        return;
+    }
+    if (v_batt_01v == 0u || i_batt_01a == 0u || eff_permille == 0u) {
+        return;
+    }
+    if (v_inlet_01v != 0u && in_window(v_inlet_01v, v_win_lo_01v, v_win_hi_01v)) {
+        v = v_inlet_01v;
+    } else if (v_inlet_01v == 0u && in_window(v_prev_01v, v_win_lo_01v, v_win_hi_01v)) {
+        v = v_prev_01v;
+    } else if (v_inlet_01v == 0u) {
+        v = v_win_lo_01v;
+    } else {
+        return;
+    }
+    i = div_round_half_up((uint64_t)v_batt_01v * i_batt_01a * 1000u,
+                          (uint64_t)eff_permille * v);
+    if (i == 0u) {
+        return;
+    }
+    if (i_pile_max_01a != 0u && i > i_pile_max_01a) {
+        i = i_pile_max_01a;
+    }
+    if (i == 0u) {
+        return;
+    }
+    out->send = 1u;
+    out->v_01v = v;
+    out->i_01a = i;
+}
+
 /* 无新鲜合法 0x04 时返回 1，家充仍按 0x01。允许电流不参与。 */
 static int bat_compatible(const ChrLink *l)
 {
