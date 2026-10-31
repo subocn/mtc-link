@@ -1402,6 +1402,8 @@ static void test_i_report(void)
     enter_can_run_cap(&link, &tx, &c, 500);
     expect_eq("i rep run", link.phase, CHG_PHASE_RUN);
     expect_eq("i rep cap", link.cap.i_max_01a, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("stuck sent", link.i_tx_01a, 400);
     ccs_i(&rx, 0);
     bms_link_can_rx(&link, &rx);
     bms_link_tick(&link, &c, 800, &tx);
@@ -1421,7 +1423,8 @@ static void test_i_report(void)
     c = energy();
     enter_can_run_cap(&link, &tx, &c, 500);
     c.i_req_01a = 200;
-    bms_link_tick(&link, &c, 0, &tx);
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("stuck 20a sent", link.i_tx_01a, 200);
     ccs_i(&rx, 0);
     bms_link_can_rx(&link, &rx);
     bms_link_tick(&link, &c, 500, &tx);
@@ -1482,6 +1485,10 @@ static void test_i_report(void)
     bms_link_can_rx(&link, &rx);
     bms_link_tick(&link, &c, 1100, &tx);
     expect_eq("no cap stuck holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 1100, &tx);
+    expect_eq("no cap stuck after send", link.phase, CHG_PHASE_RUN);
     ccs_i(&rx, 5000);
     bms_link_can_rx(&link, &rx);
     expect_eq("no cap high holds", link.phase, CHG_PHASE_RUN);
@@ -1493,6 +1500,10 @@ static void test_i_report(void)
     bms_link_can_rx(&link, &rx);
     bms_link_tick(&link, &c, 1100, &tx);
     expect_eq("above cap window holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 1100, &tx);
+    expect_eq("above cap window after send", link.phase, CHG_PHASE_RUN);
     ccs_i(&rx, 300);
     bms_link_can_rx(&link, &rx);
     expect_eq("at announced max holds", link.phase, CHG_PHASE_RUN);
@@ -1664,6 +1675,184 @@ static void test_i_report(void)
     feed(&link, &c, stat, sizeof stat, &tx);
     expect_eq("485 sent high stops", link.phase, CHG_PHASE_STOP);
     expect_eq("485 sent high alarm", link.i_alarm, CHG_I_ALARM_HIGH);
+
+    /* 请求刚进入窗口、0x01 还没发出时，长拍也不按卡住停止。 */
+    c = energy();
+    c.i_req_01a = 99;
+    bms_link_init(&link, CHG_PORT_485);
+    link.phase = CHG_PHASE_RUN;
+    link.cap.i_max_01a = 500;
+    link.cap.ready = 1u;
+    link.seen_ready = 1u;
+    bms_link_tick(&link, &c, 0, &tx);
+    expect_eq("485 stall sent 9.9", link.i_tx_01a, 99);
+    pack_stat(stat, 0);
+    feed(&link, &c, stat, sizeof stat, &tx);
+    c.i_req_01a = 400;
+    link.bat_pending = 0u;
+    link.bat_turn = 0u;
+    bms_link_tick(&link, &c, 0, &tx);
+    expect_eq("485 stall still 9.9", link.i_tx_01a, 99);
+    bms_link_tick(&link, &c, 1100, &tx);
+    expect_eq("485 stall unsent holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("485 stall unsent alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    expect_eq("485 stall then 40", link.i_tx_01a, 400);
+
+    /* CAN：已发 9.9 A 时改请求到 40.0 A，BCL 未发，1100 ms 不停。发出后再按 0.8 s。 */
+    c = energy();
+    c.i_req_01a = 99;
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("edge sent 9.9", link.i_tx_01a, 99);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    c.i_req_01a = 400;
+    bms_link_tick(&link, &c, 0, &tx);
+    expect_eq("edge still 9.9", link.i_tx_01a, 99);
+    bms_link_tick(&link, &c, 1100, &tx);
+    expect_eq("edge unsent holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("edge unsent alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 800, &tx);
+    expect_eq("edge after send holds", link.phase, CHG_PHASE_RUN);
+    bms_link_tick(&link, &c, 1, &tx);
+    expect_eq("edge after send stops", link.i_alarm, CHG_I_ALARM_STUCK);
+
+    /* 20% 与 100% 两端都计入。允许时间按已发请求。 */
+    c = energy();
+    c.i_req_01a = 100;
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 5);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 500, &tx);
+    expect_eq("edge 20pct holds", link.phase, CHG_PHASE_RUN);
+    bms_link_tick(&link, &c, 1, &tx);
+    expect_eq("edge 20pct stops", link.i_alarm, CHG_I_ALARM_STUCK);
+
+    c = energy();
+    c.i_req_01a = 500;
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 1000, &tx);
+    expect_eq("edge 100pct holds", link.phase, CHG_PHASE_RUN);
+    bms_link_tick(&link, &c, 1, &tx);
+    expect_eq("edge 100pct stops", link.i_alarm, CHG_I_ALARM_STUCK);
+
+    /* 0.6 A 清掉累计。回到不超过 0.5 A 后重新计。 */
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 700, &tx);
+    expect_eq("reset low", link.i_low_ms, 700u);
+    ccs_i(&rx, 6);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 800, &tx);
+    expect_eq("reset above half", link.phase, CHG_PHASE_RUN);
+    expect_eq("reset cleared", link.i_low_ms, 0u);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 800, &tx);
+    expect_eq("reset recount holds", link.phase, CHG_PHASE_RUN);
+    bms_link_tick(&link, &c, 1, &tx);
+    expect_eq("reset recount stops", link.i_alarm, CHG_I_ALARM_STUCK);
+
+    /* 已发请求离开窗口后清累计。 */
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 700, &tx);
+    c.i_req_01a = 99;
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("leave still counting", link.i_low_ms, 750u);
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("leave cleared", link.i_low_ms, 0u);
+    expect_eq("leave holds", link.phase, CHG_PHASE_RUN);
+
+    /* 没有新帧时，残余计时本身不停止。 */
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    c.pause = 1;
+    bms_link_tick(&link, &c, 250, &tx);
+    expect_eq("resid quiet armed", link.zero_armed, 1u);
+    bms_link_tick(&link, &c, 900, &tx);
+    expect_eq("resid quiet holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("resid quiet alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    expect_eq("resid quiet time", link.i_zero_cmd_ms >= 200u, 1u);
+
+    /* 暂停后不做高出。426 高于 40.0 A 的上限 42.5 A。 */
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    c.pause = 1;
+    bms_link_tick(&link, &c, 0, &tx);
+    ccs_i(&rx, 426);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("pause skips high", link.phase, CHG_PHASE_RUN);
+    expect_eq("pause skips alarm", link.i_alarm, CHG_I_ALARM_NONE);
+
+    /* 公告最大电流不足 2.0 A 时带为 0。等于请求不停，多 0.1 A 停止。 */
+    c = energy();
+    c.i_req_01a = 10;
+    enter_can_run_cap(&link, &tx, &c, 19);
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("band0 sent", link.i_tx_01a, 10);
+    ccs_i(&rx, 10);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("band0 equal holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 11);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("band0 over stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("band0 over alarm", link.i_alarm, CHG_I_ALARM_HIGH);
+
+    c.i_req_01a = 0;
+    bms_link_tick(&link, &c, 0, &tx);
+    expect_eq("band0 clear force", link.force_stop, 0u);
+    c = energy();
+    bms_link_tick(&link, &c, 0, &tx);
+    expect_eq("band0 rehs", link.phase, CHG_PHASE_HS);
+    expect_eq("band0 tx cleared", link.i_tx_seen, 0u);
+    memset(&rx, 0, sizeof rx);
+    rx.id = CHG_CAN_CRO;
+    rx.dlc = 1;
+    rx.data[0] = 0xAA;
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 0, &tx);
+    expect_eq("band0 rerun unsent", link.i_tx_seen, 0u);
+    ccs_i(&rx, 600);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("band0 rerun holds", link.phase, CHG_PHASE_RUN);
+
+    /* RS-485 上限取等号不停，多 0.1 A 停止。最大 50.0 A、请求 9.9 A，上限 12.4 A。 */
+    c = energy();
+    bms_link_init(&link, CHG_PORT_485);
+    link.phase = CHG_PHASE_RUN;
+    link.cap.i_max_01a = 500;
+    link.cap.ready = 1u;
+    link.seen_ready = 1u;
+    bms_link_tick(&link, &c, 0, &tx);
+    c.i_req_01a = 99;
+    link.bat_pending = 0u;
+    link.bat_turn = 0u;
+    link.waiting = 0u;
+    bms_link_tick(&link, &c, 250, &tx);
+    expect_eq("485 limit sent", link.i_tx_01a, 99);
+    pack_stat(stat, 124);
+    feed(&link, &c, stat, sizeof stat, &tx);
+    expect_eq("485 limit holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("485 limit alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    link.waiting = 1u;
+    pack_stat(stat, 125);
+    feed(&link, &c, stat, sizeof stat, &tx);
+    expect_eq("485 limit stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("485 limit alarm high", link.i_alarm, CHG_I_ALARM_HIGH);
 }
 
 static void test_full_stop_rehandshake(void)

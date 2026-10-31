@@ -492,9 +492,11 @@ static void observe_i_cmd(BmsLink *l, const ChgCtrl *ctrl, uint32_t dt_ms)
     } else {
         l->i_zero_cmd_ms = 0u;
     }
-    /* 一线通没有上报电流。未见到样本时，初值 0 不计卡住。离开跟踪窗就清累计。 */
+    /* 一线通没有上报电流。未见到样本时，初值 0 不计卡住。
+     * 窗口和允许时间跟已经发出的请求。还没发出，或离开窗口，就清累计。 */
     if (l->port == CHG_PORT_SIF || l->force_stop || l->phase != CHG_PHASE_RUN || zero_cmd ||
-        l->i_report_seen == 0u || !in_track_window(l->cap.i_max_01a, l->cmd_i_req_01a) ||
+        l->i_report_seen == 0u || l->i_tx_seen == 0u ||
+        !in_track_window(l->cap.i_max_01a, l->i_tx_01a) ||
         l->stat.i_out_01a > I_NEAR_01A) {
         l->i_low_ms = 0u;
         return;
@@ -504,7 +506,7 @@ static void observe_i_cmd(BmsLink *l, const ChgCtrl *ctrl, uint32_t dt_ms)
     } else {
         l->i_low_ms = 0xFFFFFFFFu;
     }
-    if (l->i_low_ms > stuck_allow_ms(l->cmd_i_req_01a)) {
+    if (l->i_low_ms > stuck_allow_ms(l->i_tx_01a)) {
         alarm_stop(l, CHG_I_ALARM_STUCK);
     }
 }
