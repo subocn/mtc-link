@@ -168,7 +168,8 @@ static void test_can(void)
     expect_eq("can bsm run", tx.can[bsm].data[6], 0x10);
 
     c.pause = 1;
-    bms_link_tick(&link, &c, 250, &tx);
+    /* 不满 200 ms 的暂停后，上一拍 39.8 A 仍落在残余的陈旧窗内。 */
+    bms_link_tick(&link, &c, 150, &tx);
     bsm = find_can(&tx, CHG_CAN_BSM);
     expect_eq("can bsm pause", tx.can[bsm].data[6], 0x00);
     expect_eq("can pause stays", tx.phase, CHG_PHASE_RUN);
@@ -185,6 +186,8 @@ static void test_can(void)
     bms_link_can_rx(&link, &rx);
     expect_eq("ccs volts", link.stat.v_out_01v, 836);
     expect_eq("ccs amps", link.stat.i_out_01a, 398);
+    expect_eq("ccs stale not residual", link.i_alarm, CHG_I_ALARM_NONE);
+    expect_eq("ccs stale stays", link.phase, CHG_PHASE_RUN);
     bms_link_tick(&link, &c, 900, &tx);
     expect_eq("ccs keeps run", tx.phase, CHG_PHASE_RUN);
     bms_link_tick(&link, &c, 1000, &tx);
@@ -1293,6 +1296,315 @@ static void test_skip_auth(void)
 /* 满充停止由策略把停止和请求电流保持住。本链路在此期间只发 BST，不发 BRO。
  * 允许和电流回来后，第一拍仍是握手：BRO 为 00，电流字段为 0。
  * 停止期间先收到 CRO 为 AA，也不跳过这次握手。 */
+static uint16_t test_crc16(const uint8_t *data, size_t len)
+{
+    uint16_t crc = 0xFFFFu;
+    size_t i;
+    int b;
+
+    for (i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (b = 0; b < 8; b++) {
+            if (crc & 1u) {
+                crc = (uint16_t)((crc >> 1) ^ 0xA001u);
+            } else {
+                crc = (uint16_t)(crc >> 1);
+            }
+        }
+    }
+    return crc;
+}
+
+static void pack_stat(uint8_t out[13], uint16_t i_01a)
+{
+    uint16_t crc;
+
+    out[0] = 0xA5;
+    out[1] = 0x5A;
+    out[2] = 0x01;
+    out[3] = 0x03;
+    out[4] = 0x06;
+    out[5] = 0x09;
+    out[6] = 0x44;
+    out[7] = 0x03;
+    out[8] = (uint8_t)(i_01a & 0xFFu);
+    out[9] = (uint8_t)(i_01a >> 8);
+    out[10] = 0x00;
+    crc = test_crc16(out, 11);
+    out[11] = (uint8_t)(crc & 0xFFu);
+    out[12] = (uint8_t)(crc >> 8);
+}
+
+static void ccs_i(ChgCan *rx, uint16_t i_01a)
+{
+    uint16_t raw = (uint16_t)(i_01a + 4000u);
+
+    memset(rx, 0, sizeof *rx);
+    rx->id = CHG_CAN_CCS;
+    rx->dlc = 8;
+    rx->data[0] = 0x44;
+    rx->data[1] = 0x03;
+    rx->data[2] = (uint8_t)(raw & 0xFFu);
+    rx->data[3] = (uint8_t)(raw >> 8);
+    rx->data[6] = 0x01;
+}
+
+static void cml_imax(BmsLink *l, uint16_t imax)
+{
+    ChgCan rx;
+    uint16_t raw = (uint16_t)(imax + 4000u);
+
+    memset(&rx, 0, sizeof rx);
+    rx.id = CHG_CAN_CML;
+    rx.dlc = 8;
+    rx.data[0] = 0x48;
+    rx.data[1] = 0x03;
+    rx.data[2] = 0xF4;
+    rx.data[3] = 0x01;
+    rx.data[4] = (uint8_t)(raw & 0xFFu);
+    rx.data[5] = (uint8_t)(raw >> 8);
+    rx.data[6] = 0xA0;
+    rx.data[7] = 0x0F;
+    bms_link_can_rx(l, &rx);
+}
+
+static void enter_can_run_cap(BmsLink *l, BmsTx *tx, ChgCtrl *c, uint16_t imax)
+{
+    ChgCan rx;
+
+    bms_link_init(l, CHG_PORT_CAN);
+    bms_link_tick(l, c, 0, tx);
+    memset(&rx, 0, sizeof rx);
+    rx.id = CHG_CAN_CRO;
+    rx.dlc = 1;
+    rx.data[0] = 0xAA;
+    bms_link_can_rx(l, &rx);
+    bms_link_tick(l, c, 0, tx);
+    if (imax > 0u) {
+        cml_imax(l, imax);
+    }
+}
+
+/* 上报电流：近 0 卡住、零输出后的残余、高出公告最大电流的 5% 带。 */
+static void test_i_report(void)
+{
+    BmsLink link;
+    BmsTx tx;
+    ChgCtrl c = energy();
+    ChgCan rx;
+    uint8_t stat[13];
+    static const uint8_t known[] = {0xA5, 0x5A, 0x01, 0x03, 0x06, 0x09, 0x44, 0x03,
+                                    0x8E, 0x01, 0x00, 0x8C, 0xA7};
+
+    pack_stat(stat, 398);
+    expect_mem("stat 398 crc", stat, known, sizeof known);
+
+    enter_can_run_cap(&link, &tx, &c, 500);
+    expect_eq("i rep run", link.phase, CHG_PHASE_RUN);
+    expect_eq("i rep cap", link.cap.i_max_01a, 500);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 800, &tx);
+    expect_eq("stuck 800 holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("stuck 800 alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    bms_link_tick(&link, &c, 1, &tx);
+    expect_eq("stuck 801 stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("stuck alarm", link.i_alarm, CHG_I_ALARM_STUCK);
+    expect_eq("stuck force", link.force_stop, 1u);
+    expect_eq("stuck link", link.link_ok, 0u);
+    ccs_i(&rx, 600);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("stuck keeps alarm", link.i_alarm, CHG_I_ALARM_STUCK);
+
+    c.i_req_01a = 0;
+    bms_link_tick(&link, &c, 0, &tx);
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    c.i_req_01a = 200;
+    bms_link_tick(&link, &c, 0, &tx);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 500, &tx);
+    expect_eq("stuck 20a floor", link.phase, CHG_PHASE_RUN);
+    bms_link_tick(&link, &c, 1, &tx);
+    expect_eq("stuck 20a stops", link.i_alarm, CHG_I_ALARM_STUCK);
+
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    ccs_i(&rx, 100);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 1100, &tx);
+    expect_eq("below req holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("below req alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 400);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("slew not fault", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 200);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("resume 20a holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("resume 20a alarm", link.i_alarm, CHG_I_ALARM_NONE);
+
+    ccs_i(&rx, 425);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("high limit holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 426);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("high stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("high alarm", link.i_alarm, CHG_I_ALARM_HIGH);
+    expect_eq("high force", link.force_stop, 1u);
+
+    c.i_req_01a = 0;
+    bms_link_tick(&link, &c, 0, &tx);
+    c = energy();
+    c.i_req_01a = 500;
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 0, &tx);
+    ccs_i(&rx, 500);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("at cap holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 501);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("over cap stops", link.i_alarm, CHG_I_ALARM_HIGH);
+
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 0);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 1100, &tx);
+    expect_eq("no cap stuck holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 5000);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("no cap high holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("no cap alarm", link.i_alarm, CHG_I_ALARM_NONE);
+
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 300);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 1100, &tx);
+    expect_eq("above cap window holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 400);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("clamped not high", link.i_alarm, CHG_I_ALARM_NONE);
+
+    c = energy();
+    c.i_req_01a = 99;
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 0, &tx);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 1100, &tx);
+    expect_eq("below 20pct holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 200);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("below 20pct not high", link.i_alarm, CHG_I_ALARM_NONE);
+
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    c.pause = 1;
+    /* 250 ms 让 BSM 发出。发出当拍的 39.8 A 仍是上一拍功率级。 */
+    bms_link_tick(&link, &c, 250, &tx);
+    expect_eq("resid armed", link.zero_armed, 1u);
+    expect_eq("resid arm time", link.i_zero_cmd_ms, 0u);
+    ccs_i(&rx, 398);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("resid same beat holds", link.phase, CHG_PHASE_RUN);
+    bms_link_tick(&link, &c, 199, &tx);
+    ccs_i(&rx, 398);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("resid 199 holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("resid 199 alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    bms_link_tick(&link, &c, 1, &tx);
+    ccs_i(&rx, 5);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("resid half amp holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 6);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("resid stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("resid alarm", link.i_alarm, CHG_I_ALARM_RESID);
+    expect_eq("resid force", link.force_stop, 1u);
+    c.pause = 0;
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("resid holds stop", link.phase, CHG_PHASE_STOP);
+    c.i_req_01a = 0;
+    bms_link_tick(&link, &c, 0, &tx);
+    expect_eq("resid clear force", link.force_stop, 0u);
+    c = energy();
+    bms_link_tick(&link, &c, 0, &tx);
+    expect_eq("resid rehs", link.phase, CHG_PHASE_HS);
+    expect_eq("resid alarm cleared", link.i_alarm, CHG_I_ALARM_NONE);
+
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 0);
+    c.i_req_01a = 0;
+    bms_link_tick(&link, &c, 200, &tx);
+    expect_eq("cmd stop phase", link.phase, CHG_PHASE_STOP);
+    expect_eq("cmd stop force", link.force_stop, 0u);
+    ccs_i(&rx, 398);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("cmd same beat holds", link.i_alarm, CHG_I_ALARM_NONE);
+    bms_link_tick(&link, &c, 200, &tx);
+    ccs_i(&rx, 398);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("cmd resid reason", link.i_alarm, CHG_I_ALARM_RESID);
+    expect_eq("cmd resid force stays", link.force_stop, 0u);
+    expect_eq("cmd resid phase", link.phase, CHG_PHASE_STOP);
+
+    c = energy();
+    bms_link_init(&link, CHG_PORT_SIF);
+    bms_link_tick(&link, &c, 0, &tx);
+    bms_link_tick(&link, &c, 250, &tx);
+    bms_link_tick(&link, &c, 250, &tx);
+    expect_eq("sif i run", link.phase, CHG_PHASE_RUN);
+    link.cap.i_max_01a = 500;
+    link.i_report_seen = 1u;
+    link.stat.i_out_01a = 0;
+    bms_link_tick(&link, &c, 2000, &tx);
+    expect_eq("sif skips i check", link.phase, CHG_PHASE_RUN);
+    expect_eq("sif i alarm", link.i_alarm, CHG_I_ALARM_NONE);
+
+    c = energy();
+    bms_link_init(&link, CHG_PORT_485);
+    link.phase = CHG_PHASE_RUN;
+    link.cap.i_max_01a = 500;
+    link.cap.ready = 1u;
+    link.seen_ready = 1u;
+    bms_link_tick(&link, &c, 0, &tx);
+    c.pause = 1;
+    bms_link_tick(&link, &c, 250, &tx);
+    c.pause = 0;
+    link.waiting = 1u;
+    pack_stat(stat, 398);
+    feed(&link, &c, stat, sizeof stat, &tx);
+    expect_eq("485 unpause stale holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("485 unpause alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    expect_eq("485 unpause amps", link.stat.i_out_01a, 398);
+
+    bms_link_tick(&link, &c, 0, &tx);
+    link.bat_pending = 0u;
+    link.bat_turn = 0u;
+    c.pause = 1;
+    bms_link_tick(&link, &c, 250, &tx);
+    expect_eq("485 rearm", link.zero_armed, 1u);
+    expect_eq("485 rearm time", link.i_zero_cmd_ms, 0u);
+    link.waiting = 1u;
+    pack_stat(stat, 398);
+    feed(&link, &c, stat, sizeof stat, &tx);
+    expect_eq("485 same beat holds", link.phase, CHG_PHASE_RUN);
+    bms_link_tick(&link, &c, 200, &tx);
+    link.waiting = 1u;
+    link.cap.i_max_01a = 0;
+    pack_stat(stat, 398);
+    feed(&link, &c, stat, sizeof stat, &tx);
+    expect_eq("485 resid stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("485 resid alarm", link.i_alarm, CHG_I_ALARM_RESID);
+    expect_eq("485 resid force", link.force_stop, 1u);
+}
+
 static void test_full_stop_rehandshake(void)
 {
     BmsLink link;
@@ -1380,6 +1692,7 @@ int main(void)
     test_bsm_flags();
     test_bms_null_guards();
     test_raw_guards();
+    test_i_report();
     test_full_stop_rehandshake();
     if (g_fail) {
         return 1;
