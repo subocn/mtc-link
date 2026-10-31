@@ -64,6 +64,8 @@ typedef struct {
     uint32_t i_low_ms;        /* 跟踪窗内上报仍 ≤0.5 A 的累计 */
     uint32_t i_zero_cmd_ms;   /* 零输出命令已经发出之后的连续时间 */
     uint8_t zero_armed;       /* 本段零输出命令已经交给发送。发出当拍不累计 */
+    uint8_t i_tx_seen;        /* 能量传输中已经把请求电流放进 BCL 或 0x01 */
+    uint16_t i_tx_01a;        /* 最近一帧已发请求电流。高出只跟这个数 */
     uint32_t wait_ms;
     uint8_t slow_arm;
     uint8_t fast_arm;
