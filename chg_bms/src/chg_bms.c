@@ -339,6 +339,8 @@ static void open_phase(BmsLink *l, const ChgCtrl *c)
             l->i_alarm = CHG_I_ALARM_NONE;
             l->i_report_seen = 0u;
             l->i_low_ms = 0u;
+            l->i_tx_seen = 0u;
+            l->i_tx_01a = 0u;
         }
         l->loss_ms = 0;
     }
@@ -444,6 +446,11 @@ static void judge_i_sample(BmsLink *l, uint16_t i_out, uint8_t pause, uint8_t st
     if (l->phase != CHG_PHASE_RUN || zero_now) {
         return;
     }
+    /* 调用方已经改小、但 BCL 或 0x01 还没发出时，仍按上一帧已发请求。 */
+    if (l->i_tx_seen == 0u) {
+        return;
+    }
+    i_req = l->i_tx_01a;
     imax = l->cap.i_max_01a;
     if (imax == 0u) {
         return;
@@ -499,6 +506,15 @@ static void observe_i_cmd(BmsLink *l, const ChgCtrl *ctrl, uint32_t dt_ms)
     }
     if (l->i_low_ms > stuck_allow_ms(l->cmd_i_req_01a)) {
         alarm_stop(l, CHG_I_ALARM_STUCK);
+    }
+}
+
+/* 能量传输中的请求电流刚写进 BCL 或 0x01。握手帧里的 0 不记。 */
+static void note_i_tx(BmsLink *l, const ChgCtrl *use)
+{
+    if (l->phase == CHG_PHASE_RUN) {
+        l->i_tx_01a = use->i_req_01a;
+        l->i_tx_seen = 1u;
     }
 }
 
@@ -705,6 +721,9 @@ static void fill_tx(BmsLink *l, const ChgCtrl *use, int send_sif, int slow, int 
     } else {
         if (fast) {
             chg_can_bcl(use, &f);
+            if (tx->can_n < 8u) {
+                note_i_tx(l, use);
+            }
             push_can(tx, &f);
         }
         if (slow) {
@@ -772,6 +791,7 @@ static void send_485(BmsLink *l, const ChgCtrl *use, int slow, int bst, BmsTx *t
     n = chg_ctrl_pack(use, tx->frame, sizeof tx->frame);
     if (n > 0) {
         tx->frame_len = (uint8_t)n;
+        note_i_tx(l, use);
         note_zero_tx(l);
         l->waiting = 1u;
         l->wait_ms = 0;

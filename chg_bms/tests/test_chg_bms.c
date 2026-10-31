@@ -1463,6 +1463,12 @@ static void test_i_report(void)
     c.i_req_01a = 500;
     enter_can_run_cap(&link, &tx, &c, 500);
     bms_link_tick(&link, &c, 0, &tx);
+    expect_eq("over cap unsent", link.i_tx_seen, 0u);
+    ccs_i(&rx, 501);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("over cap before bcl holds", link.phase, CHG_PHASE_RUN);
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("over cap sent", link.i_tx_01a, 500);
     ccs_i(&rx, 500);
     bms_link_can_rx(&link, &rx);
     expect_eq("at cap holds", link.phase, CHG_PHASE_RUN);
@@ -1616,9 +1622,17 @@ static void test_i_report(void)
     /* 现场：请求已从 40.0 A 降到 30.0 A，上报仍停在 40.0 A。最大 50.0 A，带 2.5 A。 */
     c = energy();
     enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("stepdown sent 40", link.i_tx_01a, 400);
     c.i_req_01a = 300;
     bms_link_tick(&link, &c, 0, &tx);
     expect_eq("stepdown req", link.cmd_i_req_01a, 300);
+    expect_eq("stepdown still 40", link.i_tx_01a, 400);
+    ccs_i(&rx, 400);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("stepdown unsent holds", link.phase, CHG_PHASE_RUN);
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("stepdown sent 30", link.i_tx_01a, 300);
     ccs_i(&rx, 325);
     bms_link_can_rx(&link, &rx);
     expect_eq("stepdown limit holds", link.phase, CHG_PHASE_RUN);
@@ -1627,6 +1641,29 @@ static void test_i_report(void)
     bms_link_can_rx(&link, &rx);
     expect_eq("stepdown frozen stops", link.phase, CHG_PHASE_STOP);
     expect_eq("stepdown alarm", link.i_alarm, CHG_I_ALARM_HIGH);
+
+    /* RS-485：0x01 还没带上 9.9 A 时，上报 20.0 A 不停。发出后再判。 */
+    c = energy();
+    bms_link_init(&link, CHG_PORT_485);
+    link.phase = CHG_PHASE_RUN;
+    link.cap.i_max_01a = 500;
+    link.cap.ready = 1u;
+    link.seen_ready = 1u;
+    bms_link_tick(&link, &c, 0, &tx);
+    expect_eq("485 sent 40", link.i_tx_01a, 400);
+    c.i_req_01a = 99;
+    pack_stat(stat, 200);
+    feed(&link, &c, stat, sizeof stat, &tx);
+    expect_eq("485 unsent holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("485 unsent alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    link.bat_pending = 0u;
+    link.bat_turn = 0u;
+    bms_link_tick(&link, &c, 250, &tx);
+    expect_eq("485 sent 9.9", link.i_tx_01a, 99);
+    pack_stat(stat, 200);
+    feed(&link, &c, stat, sizeof stat, &tx);
+    expect_eq("485 sent high stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("485 sent high alarm", link.i_alarm, CHG_I_ALARM_HIGH);
 }
 
 static void test_full_stop_rehandshake(void)
