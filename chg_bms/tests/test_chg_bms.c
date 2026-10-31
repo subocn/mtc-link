@@ -1603,6 +1603,21 @@ static void test_i_report(void)
     expect_eq("485 resid stops", link.phase, CHG_PHASE_STOP);
     expect_eq("485 resid alarm", link.i_alarm, CHG_I_ALARM_RESID);
     expect_eq("485 resid force", link.force_stop, 1u);
+
+    /* 现场：请求已从 40.0 A 降到 30.0 A，上报仍停在 40.0 A。最大 50.0 A，带 2.5 A。 */
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    c.i_req_01a = 300;
+    bms_link_tick(&link, &c, 0, &tx);
+    expect_eq("stepdown req", link.cmd_i_req_01a, 300);
+    ccs_i(&rx, 325);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("stepdown limit holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("stepdown limit alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    ccs_i(&rx, 400);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("stepdown frozen stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("stepdown alarm", link.i_alarm, CHG_I_ALARM_HIGH);
 }
 
 static void test_full_stop_rehandshake(void)
