@@ -397,7 +397,7 @@ static void alarm_stop(BmsLink *l, uint8_t code)
 
 static int in_track_window(uint16_t imax, uint16_t req)
 {
-    /* 20%–100%，两端都含。整数除法。没有公告最大电流时不做卡住和高出。 */
+    /* 近 0 卡住只看 20%–100%，两端都含。高出不走这个窗口。 */
     if (imax == 0u) {
         return 0;
     }
@@ -444,11 +444,16 @@ static void judge_i_sample(BmsLink *l, uint16_t i_out, uint8_t pause, uint8_t st
     if (l->phase != CHG_PHASE_RUN || zero_now) {
         return;
     }
-    if (!in_track_window(l->cap.i_max_01a, i_req)) {
+    imax = l->cap.i_max_01a;
+    if (imax == 0u) {
         return;
     }
-    imax = l->cap.i_max_01a;
-    sum = (uint32_t)i_req + (uint32_t)(imax / 20u);
+    /* 请求高于公告最大电流时，上限就是该最大电流，不按超出的请求加带。 */
+    if (i_req > imax) {
+        sum = (uint32_t)imax + (uint32_t)(imax / 20u);
+    } else {
+        sum = (uint32_t)i_req + (uint32_t)(imax / 20u);
+    }
     if (sum > imax || sum > 65535u) {
         limit = imax;
     } else {
