@@ -340,7 +340,9 @@ static void open_phase(BmsLink *l, const ChgCtrl *c)
             l->i_report_seen = 0u;
             l->i_low_ms = 0u;
             l->i_tx_seen = 0u;
+            l->i_high_hold = 0u;
             l->i_tx_01a = 0u;
+            l->i_tx_prev_01a = 0u;
         }
         l->loss_ms = 0;
     }
@@ -446,14 +448,21 @@ static void judge_i_sample(BmsLink *l, uint16_t i_out, uint8_t pause, uint8_t st
     if (l->phase != CHG_PHASE_RUN || zero_now) {
         return;
     }
-    /* 调用方已经改小、但 BCL 或 0x01 还没发出时，仍按上一帧已发请求。 */
+    /* 还没发出过请求时不做高出。没有公告最大电流时也不做，且不消耗待判的上一帧。 */
     if (l->i_tx_seen == 0u) {
         return;
     }
-    i_req = l->i_tx_01a;
     imax = l->cap.i_max_01a;
     if (imax == 0u) {
         return;
+    }
+    /* 新请求已经发出后，第一帧仍是改写前的功率级，按改写前的已发请求。
+     * 尚未发出时 i_high_hold 为 0，仍用最近一帧已发请求。 */
+    if (l->i_high_hold) {
+        i_req = l->i_tx_prev_01a;
+        l->i_high_hold = 0u;
+    } else {
+        i_req = l->i_tx_01a;
     }
     /* 请求高于公告最大电流时，上限就是该最大电流，不按超出的请求加带。 */
     if (i_req > imax) {
@@ -511,13 +520,19 @@ static void observe_i_cmd(BmsLink *l, const ChgCtrl *ctrl, uint32_t dt_ms)
     }
 }
 
-/* 能量传输中的请求电流刚写进 BCL 或 0x01。握手帧里的 0 不记。 */
+/* 能量传输中的请求电流刚写进 BCL 或 0x01。握手帧里的 0 不记。
+ * 第一次发出只记下当前请求。之后改写时留下改写前的值，且不覆盖更早的一帧。 */
 static void note_i_tx(BmsLink *l, const ChgCtrl *use)
 {
-    if (l->phase == CHG_PHASE_RUN) {
-        l->i_tx_01a = use->i_req_01a;
-        l->i_tx_seen = 1u;
+    if (l->phase != CHG_PHASE_RUN) {
+        return;
     }
+    if (l->i_tx_seen && use->i_req_01a != l->i_tx_01a && l->i_high_hold == 0u) {
+        l->i_tx_prev_01a = l->i_tx_01a;
+        l->i_high_hold = 1u;
+    }
+    l->i_tx_01a = use->i_req_01a;
+    l->i_tx_seen = 1u;
 }
 
 /* 零输出命令刚交给发送。同拍返回的 CCS / 0x03 仍是上一拍功率级，计时从下一拍起。 */

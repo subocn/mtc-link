@@ -65,7 +65,9 @@ typedef struct {
     uint32_t i_zero_cmd_ms;   /* 零输出命令已经发出之后的连续时间 */
     uint8_t zero_armed;       /* 本段零输出命令已经交给发送。发出当拍不累计 */
     uint8_t i_tx_seen;        /* 能量传输中已经把请求电流放进 BCL 或 0x01 */
-    uint16_t i_tx_01a;        /* 最近一帧已发请求电流。高出只跟这个数 */
+    uint8_t i_high_hold;      /* 已发请求刚改写。下一帧高出仍按改写前的请求 */
+    uint16_t i_tx_01a;        /* 最近一帧已发请求电流 */
+    uint16_t i_tx_prev_01a;   /* 改写前已经发出的请求。只在 i_high_hold 为 1 时使用 */
     uint32_t wait_ms;
     uint8_t slow_arm;
     uint8_t fast_arm;

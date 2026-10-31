@@ -1644,16 +1644,91 @@ static void test_i_report(void)
     expect_eq("stepdown unsent holds", link.phase, CHG_PHASE_RUN);
     bms_link_tick(&link, &c, 50, &tx);
     expect_eq("stepdown sent 30", link.i_tx_01a, 300);
+    expect_eq("stepdown hold", link.i_high_hold, 1u);
+    expect_eq("stepdown prev", link.i_tx_prev_01a, 400);
     ccs_i(&rx, 325);
     bms_link_can_rx(&link, &rx);
     expect_eq("stepdown limit holds", link.phase, CHG_PHASE_RUN);
     expect_eq("stepdown limit alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    expect_eq("stepdown hold spent", link.i_high_hold, 0u);
     ccs_i(&rx, 400);
     bms_link_can_rx(&link, &rx);
     expect_eq("stepdown frozen stops", link.phase, CHG_PHASE_STOP);
     expect_eq("stepdown alarm", link.i_alarm, CHG_I_ALARM_HIGH);
 
-    /* RS-485：0x01 还没带上 9.9 A 时，上报 20.0 A 不停。发出后再判。 */
+    /* 发出 30.0 A 之后，第一帧 CCS 仍是 40.0 A，按 42.5 A。下一帧才按 32.5 A。 */
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    c.i_req_01a = 300;
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("lag sent 30", link.i_tx_01a, 300);
+    expect_eq("lag hold", link.i_high_hold, 1u);
+    expect_eq("lag prev", link.i_tx_prev_01a, 400);
+    ccs_i(&rx, 400);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("lag first holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("lag first alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    expect_eq("lag hold spent", link.i_high_hold, 0u);
+    ccs_i(&rx, 400);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("lag second stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("lag second alarm", link.i_alarm, CHG_I_ALARM_HIGH);
+
+    /* 第一帧已经高于改写前的上限 42.5 A，当拍停止。 */
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    c.i_req_01a = 300;
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 426);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("lag over old stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("lag over old alarm", link.i_alarm, CHG_I_ALARM_HIGH);
+
+    /* 40.0 A 再降到 30.0 A、再降到 20.0 A，中间没有上报。第一帧仍按 40.0 A。 */
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    c.i_req_01a = 300;
+    bms_link_tick(&link, &c, 50, &tx);
+    c.i_req_01a = 200;
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("lag twice sent", link.i_tx_01a, 200);
+    expect_eq("lag twice prev", link.i_tx_prev_01a, 400);
+    expect_eq("lag twice hold", link.i_high_hold, 1u);
+    ccs_i(&rx, 400);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("lag twice first holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 400);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("lag twice second stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("lag twice alarm", link.i_alarm, CHG_I_ALARM_HIGH);
+
+    /* 暂停的那一帧不做高出，也不消耗按改写前请求的这一次。 */
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    c.i_req_01a = 300;
+    bms_link_tick(&link, &c, 50, &tx);
+    c.pause = 1;
+    bms_link_tick(&link, &c, 0, &tx);
+    ccs_i(&rx, 400);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("lag pause holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("lag pause keeps", link.i_high_hold, 1u);
+    c.pause = 0;
+    bms_link_tick(&link, &c, 0, &tx);
+    ccs_i(&rx, 400);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("lag after pause holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("lag after pause spent", link.i_high_hold, 0u);
+    ccs_i(&rx, 400);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("lag after pause stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("lag after pause alarm", link.i_alarm, CHG_I_ALARM_HIGH);
+
+    /* RS-485：0x01 还没带上 9.9 A 时，上报 20.0 A 不停。发出后第一帧仍按 40.0 A。 */
     c = energy();
     bms_link_init(&link, CHG_PORT_485);
     link.phase = CHG_PHASE_RUN;
@@ -1671,6 +1746,14 @@ static void test_i_report(void)
     link.bat_turn = 0u;
     bms_link_tick(&link, &c, 250, &tx);
     expect_eq("485 sent 9.9", link.i_tx_01a, 99);
+    expect_eq("485 grace hold", link.i_high_hold, 1u);
+    expect_eq("485 grace prev", link.i_tx_prev_01a, 400);
+    pack_stat(stat, 200);
+    feed(&link, &c, stat, sizeof stat, &tx);
+    expect_eq("485 sent grace holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("485 sent grace alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    expect_eq("485 grace spent", link.i_high_hold, 0u);
+    link.waiting = 1u;
     pack_stat(stat, 200);
     feed(&link, &c, stat, sizeof stat, &tx);
     expect_eq("485 sent high stops", link.phase, CHG_PHASE_STOP);
