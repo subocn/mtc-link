@@ -1487,9 +1487,14 @@ static void test_i_report(void)
     bms_link_can_rx(&link, &rx);
     bms_link_tick(&link, &c, 1100, &tx);
     expect_eq("above cap window holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 300);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("at announced max holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("at announced max alarm", link.i_alarm, CHG_I_ALARM_NONE);
     ccs_i(&rx, 400);
     bms_link_can_rx(&link, &rx);
-    expect_eq("clamped not high", link.i_alarm, CHG_I_ALARM_NONE);
+    expect_eq("over announced max stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("over announced max alarm", link.i_alarm, CHG_I_ALARM_HIGH);
 
     c = energy();
     c.i_req_01a = 99;
@@ -1499,9 +1504,13 @@ static void test_i_report(void)
     bms_link_can_rx(&link, &rx);
     bms_link_tick(&link, &c, 1100, &tx);
     expect_eq("below 20pct holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 124);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("below 20pct limit holds", link.phase, CHG_PHASE_RUN);
     ccs_i(&rx, 200);
     bms_link_can_rx(&link, &rx);
-    expect_eq("below 20pct not high", link.i_alarm, CHG_I_ALARM_NONE);
+    expect_eq("below 20pct high stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("below 20pct high alarm", link.i_alarm, CHG_I_ALARM_HIGH);
 
     c = energy();
     enter_can_run_cap(&link, &tx, &c, 500);
