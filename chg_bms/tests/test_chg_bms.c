@@ -1918,6 +1918,217 @@ static void test_full_stop_rehandshake(void)
     }
 }
 
+/* 第 5.5 节还没单列的边界：未收到电流帧、请求改大但未发、允许时间公式、
+ * 带从 0 变成 0.1 A、公告最大电流中途缩小、故障帧与非法字节不改判电流、
+ * 最后一帧仍有电流时按静默停止、0x02 不是电流样本、请求 0 的残余只记原因。 */
+static void test_i_report_more(void)
+{
+    BmsLink link;
+    BmsTx tx;
+    ChgCtrl c = energy();
+    ChgCan rx;
+    uint8_t stat[13];
+    static const uint8_t cap1[] = {
+        0xA5, 0x5A, 0x01, 0x02, 0x09, 0x01, 0xF4, 0x01, 0xE8, 0x03,
+        0x0A, 0x00, 0x20, 0x03, 0xEA, 0x7C};
+
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    bms_link_tick(&link, &c, 1100, &tx);
+    expect_eq("no sample holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("no sample alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    expect_eq("no sample seen", link.i_report_seen, 0u);
+    expect_eq("no sample low", link.i_low_ms, 0u);
+
+    c = energy();
+    c.i_req_01a = 100;
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("raise sent 10", link.i_tx_01a, 100);
+    c.i_req_01a = 400;
+    bms_link_tick(&link, &c, 0, &tx);
+    expect_eq("raise still 10", link.i_tx_01a, 100);
+    ccs_i(&rx, 125);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("raise old limit holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 126);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("raise old limit stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("raise old limit alarm", link.i_alarm, CHG_I_ALARM_HIGH);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("high alarm sticks", link.i_alarm, CHG_I_ALARM_HIGH);
+    expect_eq("high alarm force", link.force_stop, 1u);
+
+    c = energy();
+    c.i_req_01a = 300;
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 600, &tx);
+    expect_eq("ramp 30a holds", link.phase, CHG_PHASE_RUN);
+    bms_link_tick(&link, &c, 1, &tx);
+    expect_eq("ramp 30a stops", link.i_alarm, CHG_I_ALARM_STUCK);
+    ccs_i(&rx, 600);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("stuck alarm sticks", link.i_alarm, CHG_I_ALARM_STUCK);
+
+    c = energy();
+    c.i_req_01a = 10;
+    enter_can_run_cap(&link, &tx, &c, 20);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 11);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("band1 equal holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 12);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("band1 over stops", link.i_alarm, CHG_I_ALARM_HIGH);
+
+    c = energy();
+    c.i_req_01a = 20;
+    enter_can_run_cap(&link, &tx, &c, 20);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 20);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("band1 at max holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 21);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("band1 at max stops", link.i_alarm, CHG_I_ALARM_HIGH);
+
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 425);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("cml before holds", link.phase, CHG_PHASE_RUN);
+    cml_imax(&link, 300);
+    ccs_i(&rx, 300);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("cml shrink holds", link.phase, CHG_PHASE_RUN);
+    ccs_i(&rx, 301);
+    bms_link_can_rx(&link, &rx);
+    expect_eq("cml shrink stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("cml shrink alarm", link.i_alarm, CHG_I_ALARM_HIGH);
+
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 600);
+    rx.data[6] = 0x00;
+    bms_link_can_rx(&link, &rx);
+    expect_eq("fault not high", link.phase, CHG_PHASE_STOP);
+    expect_eq("fault not high alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    expect_eq("fault not high force", link.force_stop, 1u);
+
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 600);
+    rx.data[6] = 0x02;
+    bms_link_can_rx(&link, &rx);
+    expect_eq("bad byte6 holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("bad byte6 seen", link.i_report_seen, 0u);
+    bms_link_tick(&link, &c, 1100, &tx);
+    expect_eq("bad byte6 still", link.phase, CHG_PHASE_RUN);
+    expect_eq("bad byte6 alarm", link.i_alarm, CHG_I_ALARM_NONE);
+
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 400);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 1000, &tx);
+    expect_eq("silence 1000 holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("silence 1000 low", link.i_low_ms, 0u);
+    expect_eq("silence 1000 alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    bms_link_tick(&link, &c, 200, &tx);
+    expect_eq("silence 1200 stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("silence 1200 alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    expect_eq("silence 1200 force", link.force_stop, 1u);
+
+    c = energy();
+    c.i_req_01a = 4;
+    enter_can_run_cap(&link, &tx, &c, 23);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 500, &tx);
+    expect_eq("win inside holds", link.phase, CHG_PHASE_RUN);
+    bms_link_tick(&link, &c, 1, &tx);
+    expect_eq("win inside stops", link.i_alarm, CHG_I_ALARM_STUCK);
+
+    c = energy();
+    c.i_req_01a = 3;
+    enter_can_run_cap(&link, &tx, &c, 23);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 1100, &tx);
+    expect_eq("win outside holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("win outside alarm", link.i_alarm, CHG_I_ALARM_NONE);
+
+    c = energy();
+    bms_link_init(&link, CHG_PORT_485);
+    link.phase = CHG_PHASE_RUN;
+    link.cap.i_max_01a = 500;
+    link.cap.ready = 1u;
+    link.seen_ready = 1u;
+    bms_link_tick(&link, &c, 0, &tx);
+    feed(&link, &c, cap1, sizeof cap1, &tx);
+    expect_eq("485 cap not sample", link.i_report_seen, 0u);
+    expect_eq("485 cap holds", link.phase, CHG_PHASE_RUN);
+    bms_link_tick(&link, &c, 1100, &tx);
+    expect_eq("485 cap no stall", link.phase, CHG_PHASE_RUN);
+    expect_eq("485 cap alarm", link.i_alarm, CHG_I_ALARM_NONE);
+
+    c.i_req_01a = 0;
+    link.bat_pending = 0u;
+    link.bat_turn = 0u;
+    link.waiting = 0u;
+    bms_link_tick(&link, &c, 250, &tx);
+    expect_eq("485 zero phase", link.phase, CHG_PHASE_STOP);
+    expect_eq("485 zero force", link.force_stop, 0u);
+    expect_eq("485 zero armed", link.zero_armed, 1u);
+    pack_stat(stat, 398);
+    feed(&link, &c, stat, sizeof stat, &tx);
+    expect_eq("485 zero same beat", link.i_alarm, CHG_I_ALARM_NONE);
+    bms_link_tick(&link, &c, 200, &tx);
+    link.waiting = 1u;
+    pack_stat(stat, 398);
+    feed(&link, &c, stat, sizeof stat, &tx);
+    expect_eq("485 zero resid", link.i_alarm, CHG_I_ALARM_RESID);
+    expect_eq("485 zero force stays", link.force_stop, 0u);
+    expect_eq("485 zero still stop", link.phase, CHG_PHASE_STOP);
+
+    /* 离开窗口清掉的累计不得带进下一次进入。恰好 0.5 A 重新计。 */
+    c = energy();
+    enter_can_run_cap(&link, &tx, &c, 500);
+    bms_link_tick(&link, &c, 50, &tx);
+    ccs_i(&rx, 0);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 700, &tx);
+    expect_eq("reenter low", link.i_low_ms, 700u);
+    c.i_req_01a = 99;
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("reenter old still", link.i_low_ms, 750u);
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("reenter cleared", link.i_low_ms, 0u);
+    c.i_req_01a = 400;
+    bms_link_tick(&link, &c, 50, &tx);
+    expect_eq("reenter sent 40", link.i_tx_01a, 400);
+    expect_eq("reenter still zero", link.i_low_ms, 0u);
+    ccs_i(&rx, 5);
+    bms_link_can_rx(&link, &rx);
+    bms_link_tick(&link, &c, 800, &tx);
+    expect_eq("reenter 800 holds", link.phase, CHG_PHASE_RUN);
+    expect_eq("reenter 800 alarm", link.i_alarm, CHG_I_ALARM_NONE);
+    expect_eq("reenter 800 low", link.i_low_ms, 800u);
+    bms_link_tick(&link, &c, 1, &tx);
+    expect_eq("reenter 801 stops", link.phase, CHG_PHASE_STOP);
+    expect_eq("reenter 801 alarm", link.i_alarm, CHG_I_ALARM_STUCK);
+}
+
 int main(void)
 {
     test_sif();
@@ -1943,6 +2154,7 @@ int main(void)
     test_bms_null_guards();
     test_raw_guards();
     test_i_report();
+    test_i_report_more();
     test_full_stop_rehandshake();
     if (g_fail) {
         return 1;
