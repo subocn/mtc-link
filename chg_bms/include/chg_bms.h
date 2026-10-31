@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: Apache-2.0
  * BMS 侧充电通信。BMS 侧实现。
  * 语义见 doc/protocol.md。本工程不计算输出电流。
+ * CAN 与 RS-485 对上报电流做近 0、残余和高出三项检查。一线通不做。
  * 电池信息只在 0x04 里发给充电机，不参与充电控制。
  * 一次会话只用一个口：一线通、CAN 或 RS-485。
  */
@@ -22,6 +23,12 @@
 #define CHG_PHASE_HS 1u
 #define CHG_PHASE_RUN 2u
 #define CHG_PHASE_STOP 3u
+
+/* 上报电流检查的原因。不进 0x01–0x08。0 表示这三项尚未触发。 */
+#define CHG_I_ALARM_NONE 0u
+#define CHG_I_ALARM_STUCK 1u
+#define CHG_I_ALARM_RESID 2u
+#define CHG_I_ALARM_HIGH 3u
 
 /* ChgCtrl/ChgCap/ChgStat/ChgBat/ChgCan 由 chg_link_common.h 提供。 */
 
@@ -49,6 +56,14 @@ typedef struct {
     uint32_t rx_drop;         /* 优先级 / 源地址 / 目的地址不符 */
     uint8_t ccs_seen;
     uint8_t period_late;
+    uint8_t i_alarm;          /* CHG_I_ALARM_*。已经因故障停过就不再改写 */
+    uint8_t i_report_seen;    /* 已收过一帧无故障的 CCS 或 0x03 */
+    uint8_t cmd_pause;        /* 最近一拍调用方命令。CAN 收帧没有 ctrl，用这组快照 */
+    uint8_t cmd_stop;
+    uint16_t cmd_i_req_01a;
+    uint32_t i_low_ms;        /* 跟踪窗内上报仍 ≤0.5 A 的累计 */
+    uint32_t i_zero_cmd_ms;   /* 零输出命令已经发出之后的连续时间 */
+    uint8_t zero_armed;       /* 本段零输出命令已经交给发送。发出当拍不累计 */
     uint32_t wait_ms;
     uint8_t slow_arm;
     uint8_t fast_arm;

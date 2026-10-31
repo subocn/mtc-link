@@ -13,6 +13,10 @@
 #define T_REPLY_MS 80u
 #define T_LINE_DOWN_MS 100u  /* §10 验收 15: SIF 拉低 / CAN bus-off / 485 短路 */
 #define T_AUX_UV_MS 100u     /* §10 验收 13: 辅助电源欠压 100 ms 内停输出 */
+#define I_NEAR_01A 5u        /* 0.5 A。不超过此值算近 0；大于此值才算残余 */
+#define I_ZERO_HOLD_MS 200u  /* 零输出命令连续满此时长后，新样本才判残余 */
+#define I_STUCK_FLOOR_MS 500u
+#define I_SLEW_01A_PER_S 500u /* 50 A/s，只用于卡住的爬升留量，不另设斜率故障 */
 
 static uint16_t crc16(const uint8_t *data, size_t len)
 {
@@ -332,6 +336,9 @@ static void open_phase(BmsLink *l, const ChgCtrl *c)
         l->sif_sent = 0;
         if (from_stop) {
             l->seen_ready = 0u;
+            l->i_alarm = CHG_I_ALARM_NONE;
+            l->i_report_seen = 0u;
+            l->i_low_ms = 0u;
         }
         l->loss_ms = 0;
     }
@@ -373,6 +380,130 @@ static void remember_stat(BmsLink *l, const ChgStat *s)
     l->stat = *s;
     l->loss_ms = 0;
     l->link_ok = 1u;
+}
+
+static void alarm_stop(BmsLink *l, uint8_t code)
+{
+    if (l->i_alarm == CHG_I_ALARM_NONE) {
+        l->i_alarm = code;
+    }
+    l->phase = CHG_PHASE_STOP;
+    l->force_stop = 1u;
+    l->link_ok = 0u;
+    l->seen_ready = 0u;
+    l->sif_sent = 0u;
+    l->waiting = 0u;
+}
+
+static int in_track_window(uint16_t imax, uint16_t req)
+{
+    /* 20%–100%，两端都含。整数除法。没有公告最大电流时不做卡住和高出。 */
+    if (imax == 0u) {
+        return 0;
+    }
+    if (req < imax / 5u || req > imax) {
+        return 0;
+    }
+    return 1;
+}
+
+static uint32_t stuck_allow_ms(uint16_t req_01a)
+{
+    uint32_t ramp = ((uint32_t)req_01a * 1000u) / I_SLEW_01A_PER_S;
+
+    if (ramp < I_STUCK_FLOOR_MS) {
+        return I_STUCK_FLOOR_MS;
+    }
+    return ramp;
+}
+
+/* pause/stop/i_req 是这一样本对应的命令。CAN 用上一拍快照，RS-485 用本帧携带的 ctrl。 */
+static void judge_i_sample(BmsLink *l, uint16_t i_out, uint8_t pause, uint8_t stop, uint16_t i_req)
+{
+    uint16_t imax;
+    uint32_t sum;
+    uint16_t limit;
+    int zero_now;
+
+    l->i_report_seen = 1u;
+    if (l->port == CHG_PORT_SIF || l->force_stop) {
+        return;
+    }
+    zero_now = pause || stop || i_req == 0u;
+    if (zero_now && l->i_zero_cmd_ms >= I_ZERO_HOLD_MS && i_out > I_NEAR_01A) {
+        /* 命令已经把会话停住时只记原因，避免把 force_stop 的清除语义反过来。 */
+        if (l->phase == CHG_PHASE_STOP && l->force_stop == 0u) {
+            if (l->i_alarm == CHG_I_ALARM_NONE) {
+                l->i_alarm = CHG_I_ALARM_RESID;
+            }
+            return;
+        }
+        alarm_stop(l, CHG_I_ALARM_RESID);
+        return;
+    }
+    if (l->phase != CHG_PHASE_RUN || zero_now) {
+        return;
+    }
+    if (!in_track_window(l->cap.i_max_01a, i_req)) {
+        return;
+    }
+    imax = l->cap.i_max_01a;
+    sum = (uint32_t)i_req + (uint32_t)(imax / 20u);
+    if (sum > imax || sum > 65535u) {
+        limit = imax;
+    } else {
+        limit = (uint16_t)sum;
+    }
+    if (i_out > limit) {
+        alarm_stop(l, CHG_I_ALARM_HIGH);
+    }
+}
+
+static void observe_i_cmd(BmsLink *l, const ChgCtrl *ctrl, uint32_t dt_ms)
+{
+    int zero_cmd;
+
+    l->cmd_pause = ctrl->pause ? 1u : 0u;
+    l->cmd_stop = ctrl->stop ? 1u : 0u;
+    l->cmd_i_req_01a = ctrl->i_req_01a;
+    zero_cmd = l->cmd_pause || l->cmd_stop || l->cmd_i_req_01a == 0u;
+    /* 计时从命令发出之后的下一拍开始。还没发出时，总线上仍是上一段电流。 */
+    if (!zero_cmd) {
+        l->i_zero_cmd_ms = 0u;
+        l->zero_armed = 0u;
+    } else if (l->zero_armed) {
+        if (l->i_zero_cmd_ms <= 0xFFFFFFFFu - dt_ms) {
+            l->i_zero_cmd_ms += dt_ms;
+        } else {
+            l->i_zero_cmd_ms = 0xFFFFFFFFu;
+        }
+    } else {
+        l->i_zero_cmd_ms = 0u;
+    }
+    /* 一线通没有上报电流。未见到样本时，初值 0 不计卡住。离开跟踪窗就清累计。 */
+    if (l->port == CHG_PORT_SIF || l->force_stop || l->phase != CHG_PHASE_RUN || zero_cmd ||
+        l->i_report_seen == 0u || !in_track_window(l->cap.i_max_01a, l->cmd_i_req_01a) ||
+        l->stat.i_out_01a > I_NEAR_01A) {
+        l->i_low_ms = 0u;
+        return;
+    }
+    if (l->i_low_ms <= 0xFFFFFFFFu - dt_ms) {
+        l->i_low_ms += dt_ms;
+    } else {
+        l->i_low_ms = 0xFFFFFFFFu;
+    }
+    if (l->i_low_ms > stuck_allow_ms(l->cmd_i_req_01a)) {
+        alarm_stop(l, CHG_I_ALARM_STUCK);
+    }
+}
+
+/* 零输出命令刚交给发送。同拍返回的 CCS / 0x03 仍是上一拍功率级，计时从下一拍起。 */
+static void note_zero_tx(BmsLink *l)
+{
+    if ((l->cmd_pause || l->cmd_stop || l->cmd_i_req_01a == 0u) && l->zero_armed == 0u) {
+        l->zero_armed = 1u;
+        l->i_zero_cmd_ms = 0u;
+    }
 }
 
 void bms_link_init(BmsLink *l, uint8_t port)
@@ -519,6 +650,7 @@ void bms_link_can_rx(BmsLink *l, const ChgCan *f)
         l->ccs_seen = 1u;
         l->ccs_gap_ms = 0u;
         remember_stat(l, &s);
+        judge_i_sample(l, s.i_out_01a, l->cmd_pause, l->cmd_stop, l->cmd_i_req_01a);
         return;
     }
     if (f->id == CHG_CAN_CST && f->dlc >= 4u) {
@@ -548,6 +680,7 @@ static void fill_tx(BmsLink *l, const ChgCtrl *use, int send_sif, int slow, int 
         int n = chg_ctrl_pack(use, tx->frame, sizeof tx->frame);
         if (n > 0) {
             tx->frame_len = (uint8_t)n;
+            note_zero_tx(l);
             if (l->phase == CHG_PHASE_HS) {
                 l->sif_sent++;
             }
@@ -562,6 +695,7 @@ static void fill_tx(BmsLink *l, const ChgCtrl *use, int send_sif, int slow, int 
         if (bst) {
             chg_can_bst(&f);
             push_can(tx, &f);
+            note_zero_tx(l);
         }
     } else {
         if (fast) {
@@ -569,10 +703,12 @@ static void fill_tx(BmsLink *l, const ChgCtrl *use, int send_sif, int slow, int 
             push_can(tx, &f);
         }
         if (slow) {
+            /* 暂停只在 BSM。BCL 仍带请求电流，不能从这一帧起算残余。 */
             chg_can_bro(use->allow, &f);
             push_can(tx, &f);
             chg_can_bsm(use->pause, use->flags, &f);
             push_can(tx, &f);
+            note_zero_tx(l);
         }
     }
     tx->phase = l->phase;
@@ -631,6 +767,7 @@ static void send_485(BmsLink *l, const ChgCtrl *use, int slow, int bst, BmsTx *t
     n = chg_ctrl_pack(use, tx->frame, sizeof tx->frame);
     if (n > 0) {
         tx->frame_len = (uint8_t)n;
+        note_zero_tx(l);
         l->waiting = 1u;
         l->wait_ms = 0;
         l->answered = 0u;
@@ -714,6 +851,7 @@ void bms_link_tick(BmsLink *l, const ChgCtrl *ctrl, uint32_t dt_ms, BmsTx *tx)
     }
     open_phase(l, ctrl);
     promote(l);
+    observe_i_cmd(l, ctrl, dt_ms);
     use = payload(l, ctrl, &held);
     tx_clear(tx, l);
     slow = due(&l->slow_ms, dt_ms, T_SLOW_MS, &l->slow_arm);
@@ -745,6 +883,9 @@ void bms_link_tick(BmsLink *l, const ChgCtrl *ctrl, uint32_t dt_ms, BmsTx *tx)
 
 static void accept_485(BmsLink *l, uint8_t msg, const uint8_t *data, uint8_t len, const ChgCtrl *ctrl)
 {
+    ChgStat s;
+    int have_stat = 0;
+
     if (l->waiting == 0u) {
         return;
     }
@@ -759,13 +900,12 @@ static void accept_485(BmsLink *l, uint8_t msg, const uint8_t *data, uint8_t len
         }
         remember_cap(l, &c);
     } else {
-        ChgStat s;
         if (load_stat(data, &s) != 0) {
             return;
         }
         remember_stat(l, &s);
         /* §10 验收 14: BMS 见 0x03 stat.fault=1 或 fault_code≠0 立即进入 STOP，
-         * 与 CAN CST (line 441-451) 对称。事件性立即 STOP，不等 T_LOSS_MS。 */
+         * 与 CAN CST 对称。事件性立即 STOP，不等 T_LOSS_MS。故障帧不再改判电流。 */
         if (s.fault || s.fault_code) {
             l->phase = CHG_PHASE_STOP;
             l->force_stop = 1u;
@@ -777,6 +917,7 @@ static void accept_485(BmsLink *l, uint8_t msg, const uint8_t *data, uint8_t len
             l->loss_ms = 0;
             return;
         }
+        have_stat = 1;
     }
     l->waiting = 0u;
     l->answered = 1u;
@@ -786,6 +927,9 @@ static void accept_485(BmsLink *l, uint8_t msg, const uint8_t *data, uint8_t len
     }
     l->link_ok = 1u;
     promote(l);
+    if (have_stat) {
+        judge_i_sample(l, s.i_out_01a, ctrl->pause ? 1u : 0u, ctrl->stop ? 1u : 0u, ctrl->i_req_01a);
+    }
 }
 
 void bms_link_rx_byte(BmsLink *l, uint8_t b, uint32_t gap_ms, const ChgCtrl *ctrl, BmsTx *tx)
